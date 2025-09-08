@@ -19,8 +19,8 @@ SLEEP_BETWEEN_PAIRS = 0.05
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-# optional image URL (https) to appear with each message (small rectangular thumbnail)
-TELEGRAM_IMAGE_URL = os.getenv("TELEGRAM_IMAGE_URL", "").strip()
+# الافتراضي שתשלח תמיד אותו תמונה אם env לא مضبوط
+TELEGRAM_IMAGE_URL = os.getenv("TELEGRAM_IMAGE_URL", "https://i.ibb.co/67XZq1QL/212.png").strip()
 
 ALERT_TTL_SECONDS = int(os.getenv("ALERT_TTL_SECONDS", "0"))
 ALERT_DEDUP_MODE = os.getenv("ALERT_DEDUP_MODE", "exact").lower()
@@ -160,40 +160,65 @@ def format_currency_flag(cur):
     flags = {"EGP": "🇪🇬","GBP": "🇬🇧","EUR": "🇪🇺","USD": "🇺🇸"}
     return flags.get(cur, "")
 
-# sendMessage / sendPhoto helper: if TELEGRAM_IMAGE_URL is set we sendPhoto(caption=message)
+# sendMessage / sendPhoto helper: robust attempts (URL -> upload -> fallback text)
 def send_telegram_alert(message):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         logging.info("Telegram token/chat not set; skipping send. Message preview:\n" + message)
         return
 
-    # prefer sendPhoto if TELEGRAM_IMAGE_URL is configured
-    if TELEGRAM_IMAGE_URL:
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
-        payload = {
-            "chat_id": TELEGRAM_CHAT_ID,
-            "photo": TELEGRAM_IMAGE_URL,
-            "caption": message,
-            "parse_mode": "HTML"
-        }
-        try:
-            r = session.post(url, json=payload, timeout=TIMEOUT)
-            r.raise_for_status()
-            logging.info("Telegram photo alert sent.")
-            return
-        except Exception as e:
-            logging.warning(f"sendPhoto failed, falling back to sendMessage: {e}")
+    # Telegram caption limit for photos is 1024 characters
+    caption = message if len(message) <= 1024 else (message[:1020] + "...")
+    photo_url = TELEGRAM_IMAGE_URL or None
 
-    # fallback to sendMessage
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML", "disable_web_page_preview": True}
+    # 1) Try sendPhoto with photo URL (form-data)
+    if photo_url:
+        try:
+            sendphoto_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
+            payload = {"chat_id": TELEGRAM_CHAT_ID, "photo": photo_url, "caption": caption, "parse_mode": "HTML"}
+            r = session.post(sendphoto_url, data=payload, timeout=TIMEOUT)
+            try:
+                jr = r.json()
+            except Exception:
+                jr = None
+            if r.ok and jr and jr.get("ok"):
+                logging.info("Telegram photo alert sent (via URL).")
+                return
+            else:
+                logging.warning(f"sendPhoto(via URL) failed status={r.status_code} json={jr} text={r.text}")
+        except Exception as e:
+            logging.warning(f"sendPhoto(via URL) exception: {e}")
+
+        # 2) Try download image and upload as multipart/form-data (more reliable)
+        try:
+            img_resp = session.get(photo_url, timeout=10)
+            img_resp.raise_for_status()
+            content_type = img_resp.headers.get("content-type", "image/png")
+            files = {"photo": ("zoozfx.png", img_resp.content, content_type)}
+            data = {"chat_id": TELEGRAM_CHAT_ID, "caption": caption, "parse_mode": "HTML"}
+            r2 = session.post(sendphoto_url, data=data, files=files, timeout=TIMEOUT)
+            try:
+                jr2 = r2.json()
+            except Exception:
+                jr2 = None
+            if r2.ok and jr2 and jr2.get("ok"):
+                logging.info("Telegram photo alert sent (uploaded file).")
+                return
+            else:
+                logging.warning(f"sendPhoto(upload) failed status={r2.status_code} json={jr2} text={r2.text}")
+        except Exception as e:
+            logging.warning(f"sendPhoto(upload) exception: {e}")
+
+    # 3) Fallback to sendMessage (text only)
     try:
-        r = session.post(url, json=payload, timeout=TIMEOUT)
-        r.raise_for_status()
-        logging.info("Telegram alert sent.")
+        sendmsg_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        payload2 = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML", "disable_web_page_preview": True}
+        r3 = session.post(sendmsg_url, json=payload2, timeout=TIMEOUT)
+        r3.raise_for_status()
+        logging.info("Telegram alert sent (text fallback).")
     except Exception as e:
         logging.error(f"Failed to send Telegram message: {e}")
 
-# ---------------------- message builders (corrected order) ----------------------
+# ---------------------- message builders (correct order) ----------------------
 ZOOZ_LINK = 'https://zoozfx.com'
 ZOOZ_HTML = f'©️<a href="{ZOOZ_LINK}">ZoozFX</a>'
 
@@ -203,8 +228,8 @@ def build_alert_message(cur, pay_friendly, sell, buy, spread_percent):
     sign = "+" if spread_percent > 0 else ""
     return (
         f"🚨 Alert {flag} — {cur} ({pay_friendly})\n\n"
-        f"🔴 Sell: <code>{buy['price']:.4f} {cur}</code>\n"
-        f"🟢 Buy: <code>{sell['price']:.4f} {cur}</code>\n\n"
+        f"🔴 Sell: <code>{sell['price']:.4f} {cur}</code>\n"
+        f"🟢 Buy: <code>{buy['price']:.4f} {cur}</code>\n\n"
         f"💰 Spread: {sign}{spread_percent:.2f}%  (<code>{abs_diff:.4f} {cur}</code>)\n\n"
         f"💥 Good Luck! {ZOOZ_HTML}"
     )
@@ -215,8 +240,8 @@ def build_update_message(cur, pay_friendly, sell, buy, spread_percent):
     sign = "+" if spread_percent > 0 else ""
     return (
         f"🔁 Update {flag} — {cur} ({pay_friendly})\n\n"
-        f"🔴 Sell: <code>{buy['price']:.4f} {cur}</code>\n"
-        f"🟢 Buy: <code>{sell['price']:.4f} {cur}</code>\n\n"
+        f"🔴 Sell: <code>{sell['price']:.4f} {cur}</code>\n"
+        f"🟢 Buy: <code>{buy['price']:.4f} {cur}</code>\n\n"
         f"💰 Spread: {sign}{spread_percent:.2f}%  (<code>{abs_diff:.4f} {cur}</code>)\n\n"
         f"💥 Good Luck! {ZOOZ_HTML}"
     )
@@ -227,8 +252,8 @@ def build_end_message(cur, pay_friendly, sell, buy, spread_percent):
     sign = "+" if spread_percent > 0 else ""
     return (
         f"✅ Ended {flag} — {cur} ({pay_friendly})\n\n"
-        f"🔴 Sell: <code>{buy['price']:.4f} {cur}</code>\n"
-        f"🟢 Buy: <code>{sell['price']:.4f} {cur}</code>\n\n"
+        f"🔴 Sell: <code>{sell['price']:.4f} {cur}</code>\n"
+        f"🟢 Buy: <code>{buy['price']:.4f} {cur}</code>\n\n"
         f"💰 Spread: {sign}{spread_percent:.2f}%  (<code>{abs_diff:.4f} {cur}</code>)\n\n"
         f"💥 Good Luck! {ZOOZ_HTML}"
     )
@@ -324,14 +349,12 @@ def process_pair(currency, method, threshold):
             continue
 
         pay_friendly = friendly_pay_names.get(variant, variant)
-        # logging deliberately shows the swapped display values
         logging.info(f"{currency} {variant}: buy(display) {sell['price']:.4f} sell(display) {buy['price']:.4f} spread {spread_percent:.2f}%")
 
         pair_key = f"{currency}|{variant}"
         state = get_active_state(pair_key)
         was_active = state["active"]
 
-        # RISING EDGE: became active
         if spread_percent >= Profit_Threshold_percent:
             if not was_active:
                 message = build_alert_message(currency, pay_friendly, sell, buy, spread_percent)
@@ -350,7 +373,6 @@ def process_pair(currency, method, threshold):
                     set_active_state_snapshot(pair_key, active=True, last_spread=spread_percent,
                                               last_buy_price=sell["price"], last_sell_price=buy["price"], mark_sent=False)
         else:
-            # FALLING EDGE
             if was_active:
                 end_msg = build_end_message(currency, pay_friendly, sell, buy, spread_percent)
                 send_telegram_alert(end_msg)
