@@ -203,8 +203,8 @@ def build_alert_message(cur, pay_friendly, sell, buy, spread_percent):
     sign = "+" if spread_percent > 0 else ""
     return (
         f"🚨 Alert {flag} — {cur} ({pay_friendly})\n\n"
-        f"🔴 Sell: <code>{sell['price']:.4f} {cur}</code>\n"
-        f"🟢 Buy: <code>{buy['price']:.4f} {cur}</code>\n\n"
+        f"🔴 Sell: <code>{buy['price']:.4f} {cur}</code>\n"
+        f"🟢 Buy: <code>{sell['price']:.4f} {cur}</code>\n\n"
         f"💰 Spread: {sign}{spread_percent:.2f}%  (<code>{abs_diff:.4f} {cur}</code>)\n\n"
         f"💥 Good Luck! {ZOOZ_HTML}"
     )
@@ -215,8 +215,8 @@ def build_update_message(cur, pay_friendly, sell, buy, spread_percent):
     sign = "+" if spread_percent > 0 else ""
     return (
         f"🔁 Update {flag} — {cur} ({pay_friendly})\n\n"
-        f"🔴 Sell: <code>{sell['price']:.4f} {cur}</code>\n"
-        f"🟢 Buy: <code>{buy['price']:.4f} {cur}</code>\n\n"
+        f"🔴 Sell: <code>{buy['price']:.4f} {cur}</code>\n"
+        f"🟢 Buy: <code>{sell['price']:.4f} {cur}</code>\n\n"
         f"💰 Spread: {sign}{spread_percent:.2f}%  (<code>{abs_diff:.4f} {cur}</code>)\n\n"
         f"💥 Good Luck! {ZOOZ_HTML}"
     )
@@ -227,8 +227,8 @@ def build_end_message(cur, pay_friendly, sell, buy, spread_percent):
     sign = "+" if spread_percent > 0 else ""
     return (
         f"✅ Ended {flag} — {cur} ({pay_friendly})\n\n"
-        f"🔴 Sell: <code>{sell['price']:.4f} {cur}</code>\n"
-        f"🟢 Buy: <code>{buy['price']:.4f} {cur}</code>\n\n"
+        f"🔴 Sell: <code>{buy['price']:.4f} {cur}</code>\n"
+        f"🟢 Buy: <code>{sell['price']:.4f} {cur}</code>\n\n"
         f"💰 Spread: {sign}{spread_percent:.2f}%  (<code>{abs_diff:.4f} {cur}</code>)\n\n"
         f"💥 Good Luck! {ZOOZ_HTML}"
     )
