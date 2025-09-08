@@ -19,11 +19,21 @@ SLEEP_BETWEEN_PAIRS = 0.05
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
+# Backward-compatible but main logic uses per-pair active states
 ALERT_TTL_SECONDS = int(os.getenv("ALERT_TTL_SECONDS", "0"))
 ALERT_DEDUP_MODE = os.getenv("ALERT_DEDUP_MODE", "exact").lower()
 
 REFRESH_EVERY = int(os.getenv("REFRESH_EVERY", "60"))
 Profit_Threshold_percent = float(os.getenv("PROFIT_THRESHOLD_PERCENT", "0.4"))
+
+# New env vars to control update behavior while active:
+# If ALERT_UPDATE_ON_ANY_CHANGE="1" -> send update whenever any numeric value changed (no threshold)
+# Otherwise use thresholds:
+# ALERT_UPDATE_MIN_DELTA_PERCENT: minimal absolute difference in spread (percentage points) to trigger an update while active (default 0.01)
+# ALERT_UPDATE_PRICE_CHANGE_PERCENT: minimal relative price change (%) for buy or sell price to trigger update while active (default 0.05)
+ALERT_UPDATE_ON_ANY_CHANGE = os.getenv("ALERT_UPDATE_ON_ANY_CHANGE", "0").strip()
+ALERT_UPDATE_MIN_DELTA_PERCENT = float(os.getenv("ALERT_UPDATE_MIN_DELTA_PERCENT", "0.01"))
+ALERT_UPDATE_PRICE_CHANGE_PERCENT = float(os.getenv("ALERT_UPDATE_PRICE_CHANGE_PERCENT", "0.05"))
 
 currency_list = ["EGP", "GBP", "EUR", "USD"]
 payment_methods_map = {
@@ -180,36 +190,116 @@ def build_alert_message(cur, pay_friendly, buy, sell, spread_percent):
         f"💥 <i>Good Luck!</i>"
     )
 
-# ---------------------- duplicate-alert protection ----------------------
-recent_alerts = {}
-recent_alerts_lock = threading.Lock()
+def build_update_message(cur, pay_friendly, buy, sell, spread_percent, prev_spread=None):
+    flag = format_currency_flag(cur)
+    abs_diff = buy["price"] - sell["price"]
+    direction = "🔁" if spread_percent >= 0 else "🔽"
+    sign = "+" if spread_percent > 0 else ""
+    prev_text = f" (prev {prev_spread:.2f}%)" if prev_spread is not None else ""
+    return (
+        f"🔁 <b>Arbitrage Update {flag} — {cur} ({pay_friendly})</b>\n\n"
+        f"🔴 <b>Sell</b>: <code>{buy['price']:.4f} {cur}</code>\n"
+        f"🟢 <b>Buy</b>: <code>{sell['price']:.4f} {cur}</code>\n\n"
+        f"{direction} <b>Spread:</b> {sign}{spread_percent:.2f}%{prev_text}  (<code>{abs_diff:.4f} {cur}</code>)\n\n"
+        f"ℹ️ Still active — will notify on further meaningful changes."
+    )
 
-def _cleanup_old_alerts(now_ts):
-    if ALERT_TTL_SECONDS <= 0: return
-    with recent_alerts_lock:
-        for k, ts in list(recent_alerts.items()):
-            if now_ts - ts > ALERT_TTL_SECONDS:
-                del recent_alerts[k]
+def build_end_message(cur, pay_friendly, buy, sell, spread_percent):
+    flag = format_currency_flag(cur)
+    abs_diff = buy["price"] - sell["price"]
+    return (
+        f"✅ <b>Arbitrage ENDED {flag} — {cur} ({pay_friendly})</b>\n\n"
+        f"Last recorded spread: {spread_percent:.2f}%  (<code>{abs_diff:.4f} {cur}</code>)\n"
+        f"Last prices — Sell: <code>{buy['price']:.4f}</code>, Buy: <code>{sell['price']:.4f}</code>\n\n"
+        f"ℹ️ Will notify again when spread ≥ {Profit_Threshold_percent:.2f}%."
+    )
 
-def is_duplicate_and_update(key):
-    now_ts = time.time()
-    _cleanup_old_alerts(now_ts)
-    with recent_alerts_lock:
-        prev = recent_alerts.get(key)
-        if prev is None:
-            recent_alerts[key] = now_ts
-            return False
-        if ALERT_TTL_SECONDS <= 0:
+# ---------------------- per-pair active state + last-sent snapshot ----------------------
+active_states = {}  # pair_key -> dict: active(bool), last_spread, last_buy_price, last_sell_price, since, last_sent_spread, last_sent_buy, last_sent_sell, last_sent_time
+active_states_lock = threading.Lock()
+
+def get_active_state(pair_key):
+    with active_states_lock:
+        rec = active_states.get(pair_key)
+        if not rec:
+            return {
+                "active": False, "last_spread": None, "last_buy_price": None, "last_sell_price": None,
+                "since": None, "last_sent_spread": None, "last_sent_buy": None, "last_sent_sell": None, "last_sent_time": None
+            }
+        return rec.copy()
+
+def set_active_state_snapshot(pair_key, *, active=None, last_spread=None, last_buy_price=None, last_sell_price=None, mark_sent=False):
+    with active_states_lock:
+        rec = active_states.get(pair_key) or {
+            "active": False, "last_spread": None, "last_buy_price": None, "last_sell_price": None,
+            "since": None, "last_sent_spread": None, "last_sent_buy": None, "last_sent_sell": None, "last_sent_time": None
+        }
+        if active is not None:
+            rec["active"] = bool(active)
+            rec["since"] = time.time() if active else None
+        if last_spread is not None:
+            rec["last_spread"] = float(last_spread)
+        if last_buy_price is not None:
+            rec["last_buy_price"] = float(last_buy_price)
+        if last_sell_price is not None:
+            rec["last_sell_price"] = float(last_sell_price)
+        if mark_sent:
+            rec["last_sent_spread"] = rec.get("last_spread")
+            rec["last_sent_buy"] = rec.get("last_buy_price")
+            rec["last_sent_sell"] = rec.get("last_sell_price")
+            rec["last_sent_time"] = time.time()
+        active_states[pair_key] = rec
+
+# ---------------------- update decision logic ----------------------
+def relative_change_percent(old, new):
+    try:
+        if old == 0:
+            return abs(new - old) * 100.0  # fallback absolute percentage-like
+        return abs((new - old) / old) * 100.0
+    except Exception:
+        return float("inf")
+
+def should_send_update(pair_state, new_spread, new_buy, new_sell):
+    """
+    Return True if an update message should be sent while the pair is active.
+    Logic:
+     - If ALERT_UPDATE_ON_ANY_CHANGE == "1" => send if ANY numeric value changed compared to last_sent_* (or if no last_sent exists)
+     - Otherwise, send if:
+         * abs(new_spread - last_sent_spread) >= ALERT_UPDATE_MIN_DELTA_PERCENT
+         OR
+         * relative change in buy or sell price >= ALERT_UPDATE_PRICE_CHANGE_PERCENT
+       If no last_sent exists, treat as send (so initial active start will already be handled separately).
+    """
+    # if no last_sent -> send (but start edge already sends start and marks sent)
+    last_sent_spread = pair_state.get("last_sent_spread")
+    last_sent_buy = pair_state.get("last_sent_buy")
+    last_sent_sell = pair_state.get("last_sent_sell")
+
+    # If no snapshot yet, don't block (caller should mark_sent after sending)
+    if last_sent_spread is None and last_sent_buy is None and last_sent_sell is None:
+        return True
+
+    # If configured to send on any change:
+    if ALERT_UPDATE_ON_ANY_CHANGE == "1":
+        if (last_sent_spread != new_spread) or (last_sent_buy != new_buy) or (last_sent_sell != new_sell):
             return True
-        if now_ts - prev <= ALERT_TTL_SECONDS:
-            return True
-        recent_alerts[key] = now_ts
         return False
 
-def make_alert_key(mode, currency, variant, buy, sell, spread_percent):
-    if mode == "currency": return f"{currency}"
-    if mode == "pair": return f"{currency}|{variant}"
-    return f"{currency}|{variant}|{buy['price']:.4f}|{sell['price']:.4f}|{spread_percent:.2f}"
+    # Compare spread absolute difference (percentage points)
+    if last_sent_spread is None:
+        spread_diff = abs(new_spread)
+    else:
+        spread_diff = abs(new_spread - last_sent_spread)
+    if spread_diff >= ALERT_UPDATE_MIN_DELTA_PERCENT:
+        return True
+
+    # Compare relative price changes
+    if last_sent_buy is not None and relative_change_percent(last_sent_buy, new_buy) >= ALERT_UPDATE_PRICE_CHANGE_PERCENT:
+        return True
+    if last_sent_sell is not None and relative_change_percent(last_sent_sell, new_sell) >= ALERT_UPDATE_PRICE_CHANGE_PERCENT:
+        return True
+
+    return False
 
 # ---------------------- core processing ----------------------
 paytype_variants_map = {"SkrillMoneybookers": ["SkrillMoneybookers","Skrill","Skrill (Moneybookers)"]}
@@ -222,32 +312,77 @@ def process_pair(currency, method, threshold):
         if not buy or not sell:
             logging.info(f"{currency} {variant}: missing side. Skip.")
             continue
+
         try:
             spread_percent = ((buy["price"] / sell["price"]) - 1) * 100
         except Exception as e:
             logging.warning(f"Spread error {currency} {variant}: {e}")
             continue
+
         pay_friendly = friendly_pay_names.get(variant, variant)
         logging.info(f"{currency} {variant}: buy {buy['price']:.4f} sell {sell['price']:.4f} spread {spread_percent:.2f}%")
+
+        pair_key = f"{currency}|{variant}"
+        state = get_active_state(pair_key)
+        was_active = state["active"]
+
+        # RISING EDGE: became active
         if spread_percent >= Profit_Threshold_percent:
-            alert_key = make_alert_key(ALERT_DEDUP_MODE, currency, variant, buy, sell, spread_percent)
-            if not is_duplicate_and_update(alert_key):
+            if not was_active:
+                # send "start" arbitrage alert (rising edge)
                 message = build_alert_message(currency, pay_friendly, buy, sell, spread_percent)
                 send_telegram_alert(message)
+                logging.info(f"Start alert sent for {pair_key} (spread {spread_percent:.2f}%)")
+                # mark active and mark as last_sent snapshot so future updates compare to this snapshot
+                set_active_state_snapshot(pair_key, active=True, last_spread=spread_percent,
+                                          last_buy_price=buy["price"], last_sell_price=sell["price"], mark_sent=True)
+            else:
+                # already active: decide whether to send an update
+                if should_send_update(state, spread_percent, buy["price"], sell["price"]):
+                    # send update
+                    prev_sent_spread = state.get("last_sent_spread")
+                    update_msg = build_update_message(currency, pay_friendly, buy, sell, spread_percent, prev_spread=prev_sent_spread)
+                    send_telegram_alert(update_msg)
+                    logging.info(f"Update alert sent for {pair_key} (spread {spread_percent:.2f}%)")
+                    # mark snapshot as sent
+                    set_active_state_snapshot(pair_key, active=True, last_spread=spread_percent,
+                                              last_buy_price=buy["price"], last_sell_price=sell["price"], mark_sent=True)
+                else:
+                    # no update to send, but refresh last observed snapshot (not last_sent)
+                    set_active_state_snapshot(pair_key, active=True, last_spread=spread_percent,
+                                              last_buy_price=buy["price"], last_sell_price=sell["price"], mark_sent=False)
+        else:
+            # FALLING EDGE: was active and now below threshold -> send single "ended" message
+            if was_active:
+                end_msg = build_end_message(currency, pay_friendly, buy, sell, spread_percent)
+                send_telegram_alert(end_msg)
+                logging.info(f"End alert sent for {pair_key} (spread {spread_percent:.2f}%)")
+                # set inactive and reset last_sent snapshot (so next rising edge sends start even if same values)
+                set_active_state_snapshot(pair_key, active=False, last_spread=spread_percent,
+                                          last_buy_price=buy["price"], last_sell_price=sell["price"], mark_sent=False)
+            else:
+                # remain inactive; update observed snapshot
+                set_active_state_snapshot(pair_key, active=False, last_spread=spread_percent,
+                                          last_buy_price=buy["price"], last_sell_price=sell["price"], mark_sent=False)
+
+        # once processed a successful variant, stop trying other variants
         break
 
 # ---------------------- main loop (wrapped) ----------------------
 def run_monitor_loop():
     logging.info(f"Monitoring: {pairs_to_monitor}. Every {REFRESH_EVERY}s")
-    logging.info(f"Threshold: {Profit_Threshold_percent}%. Mode={ALERT_DEDUP_MODE}, TTL={ALERT_TTL_SECONDS}")
+    logging.info(f"Threshold: {Profit_Threshold_percent}%. Update-any={ALERT_UPDATE_ON_ANY_CHANGE}, "
+                 f"min-delta={ALERT_UPDATE_MIN_DELTA_PERCENT}%, price-delta={ALERT_UPDATE_PRICE_CHANGE_PERCENT}%")
     try:
         while True:
             start_ts = time.time()
             with ThreadPoolExecutor(max_workers=min(len(pairs_to_monitor), 6)) as ex:
                 futures = [ex.submit(process_pair, cur, m, thr) for cur,m,thr in pairs_to_monitor]
                 for f in futures:
-                    try: f.result()
-                    except Exception as e: logging.error(f"Proc error: {e}")
+                    try:
+                        f.result()
+                    except Exception as e:
+                        logging.error(f"Proc error: {e}")
                     time.sleep(SLEEP_BETWEEN_PAIRS)
             elapsed = time.time() - start_ts
             time.sleep(max(0, REFRESH_EVERY - elapsed))
