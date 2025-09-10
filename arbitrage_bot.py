@@ -345,23 +345,17 @@ def should_send_update(pair_state, new_spread, new_buy, new_sell):
 def _normalize(s):
     return str(s).strip().lower() if s is not None else ""
 
-def adv_has_method(adv_obj, method):
-    """
-    adv_obj is adv dict (the 'adv' inside each item). method is string (one of discovered method names).
-    matching strategy: check identifier/tradeMethodName/payType fields; accept exact or substring matches (case-insensitive)
-    """
-    if not adv_obj:
-        return False
-    method_norm = _normalize(method)
-    for tm in adv_obj.get("tradeMethods", []) or []:
-        if isinstance(tm, dict):
-            for k in ("identifier", "tradeMethodName", "payType"):
-                v = _normalize(tm.get(k))
-                if not v:
-                    continue
-                if v == method_norm or method_norm in v or v in method_norm:
-                    return True
+def adv_has_method(adv, method_name):
+    # Normalize
+    target = method_name.strip().lower().replace(" ", "")
+    
+    for tm in adv.get("tradeMethods", []):
+        for key in ("identifier", "tradeMethodName"):
+            val = tm.get(key, "")
+            if val and val.strip().lower().replace(" ", "") == target:
+                return True
     return False
+
 
 def count_ads_for_method(fiat, method, trade_type, max_pages=MAX_SCAN_PAGES, rows=ROWS_PER_REQUEST, needed=MIN_ADS_PER_SIDE):
     """
