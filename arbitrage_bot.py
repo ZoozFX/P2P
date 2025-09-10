@@ -1,5 +1,4 @@
-# انسخ هذا الملف كـ arbitrage_bot.py (معدل ليدعم اكتشاف العملات وطرق الدفع ديناميكياً
-# وفحص عدد الإعلانات لكل جانب >= MIN_ADS_PER_SIDE قبل إرسال أي رسالة)
+# انسخ هذا الملف كـ arbitrage_bot.py
 import os
 import time
 import logging
@@ -12,14 +11,15 @@ from concurrent.futures import ThreadPoolExecutor
 
 # ---------------------- config (from env) ----------------------
 BINANCE_P2P_URL = "https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search"
-ROWS_PER_REQUEST = int(os.getenv("ROWS_PER_REQUEST", "20"))
-TIMEOUT = int(os.getenv("TIMEOUT", "10"))
-MAX_SCAN_PAGES = int(os.getenv("MAX_SCAN_PAGES", "60"))
-SLEEP_BETWEEN_PAGES = float(os.getenv("SLEEP_BETWEEN_PAGES", "0.09"))
-SLEEP_BETWEEN_PAIRS = float(os.getenv("SLEEP_BETWEEN_PAIRS", "0.05"))
+ROWS_PER_REQUEST = 20
+TIMEOUT = 10
+MAX_SCAN_PAGES = 60
+SLEEP_BETWEEN_PAGES = 0.09
+SLEEP_BETWEEN_PAIRS = 0.05
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+# الافتراضي שתשלח תמיד אותו תמונה אם env לא مضبوط
 TELEGRAM_IMAGE_URL = os.getenv("TELEGRAM_IMAGE_URL", "https://i.ibb.co/67XZq1QL/212.png").strip()
 
 ALERT_TTL_SECONDS = int(os.getenv("ALERT_TTL_SECONDS", "0"))
@@ -32,33 +32,31 @@ ALERT_UPDATE_ON_ANY_CHANGE = os.getenv("ALERT_UPDATE_ON_ANY_CHANGE", "0").strip(
 ALERT_UPDATE_MIN_DELTA_PERCENT = float(os.getenv("ALERT_UPDATE_MIN_DELTA_PERCENT", "0.01"))
 ALERT_UPDATE_PRICE_CHANGE_PERCENT = float(os.getenv("ALERT_UPDATE_PRICE_CHANGE_PERCENT", "0.05"))
 
+currency_list = ["EGP", "GBP", "EUR", "USD"]
+payment_methods_map = {
+    "EGP": ["InstaPay", "Vodafonecash"],
+    "GBP": ["SkrillMoneybookers"],
+    "EUR": ["SkrillMoneybookers"],
+    "USD": ["SkrillMoneybookers"]
+}
+friendly_pay_names = {
+    "SkrillMoneybookers": "Skrill",
+    "Skrill": "Skrill",
+    "InstaPay": "InstaPay",
+    "Vodafonecash": "Vodafonecash"
+}
+
 PAIRS_ENV = os.getenv("PAIRS", "").strip()
 SELECTED_CURRENCY = os.getenv("SELECTED_CURRENCY", "ALL").strip().upper()
 SELECTED_METHOD = os.getenv("SELECTED_METHOD", "ALL").strip()
 MIN_LIMIT_THRESHOLDS_ENV = os.getenv("MIN_LIMIT_THRESHOLDS", "").strip()
 
-# new envs (configurable)
-DEFAULT_MIN_LIMIT = float(os.getenv("DEFAULT_MIN_LIMIT", "100"))   # افتراضي 100 لكل العملات
-MIN_ADS_PER_SIDE = int(os.getenv("MIN_ADS_PER_SIDE", "5"))        # الحد الأدنى للإعلانات لكل جانب
-DISCOVERY_PAGES = int(os.getenv("DISCOVERY_PAGES", "3"))          # عدد الصفحات المستخدمة لاكتشاف طرق الدفع في البداية
-ASSET = os.getenv("ASSET", "USDT")                                # افتراضياً USDT (يمكن تغييره)
-
 # ---------------------- logging ----------------------
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# ---------------------- HTTP session ----------------------
-session = requests.Session()
-retries = Retry(total=3, backoff_factor=0.3, status_forcelist=[429,500,502,503,504])
-session.mount("https://", HTTPAdapter(max_retries=retries))
-HEADERS = {"Content-Type": "application/json", "User-Agent": "Mozilla/5.0 (compatible; ArbitrageChecker/1.0)"}
-
 # ---------------------- helpers ----------------------
-def parse_thresholds(env_str, defaults_map, default_value=100.0):
-    """
-    env_str: e.g. "EGP=90;GBP=100"
-    defaults_map: dict of fiat -> something (we'll fill with default_value)
-    """
-    out = {k: float(defaults_map.get(k, default_value)) for k in defaults_map}
+def parse_thresholds(env_str, defaults):
+    out = {k: float("inf") for k in defaults}
     if not env_str:
         return out
     parts = [p.strip() for p in env_str.replace(",", ";").split(";") if p.strip()]
@@ -92,99 +90,87 @@ def parse_pairs_env(env_str, thresholds, default_map):
             pairs.append((cur, m, thresholds.get(cur, float("inf"))))
     return pairs
 
-# ---------------------- Binance P2P discovery (fiat <-> methods) ----------------------
-# A broad candidate fiat list (covers most fiat codes Binance P2P commonly supports).
-FIAT_CANDIDATES = [
-    "AED","AFN","ALL","AMD","ANG","AOA","ARS","AUD","AWG","AZN","BAM","BDT","BGN","BHD","BIF","BMD","BND","BOB","BRL","BSD","BTN","BWP","BYN","BZD",
-    "CAD","CDF","CHF","CLP","CNY","COP","CRC","CUP","CVE","CZK","DJF","DKK","DOP","DZD","EGP","ERN","ETB","EUR","FJD","FKP","GBP","GEL","GHS","GIP","GMD","GNF",
-    "GTQ","GYD","HKD","HNL","HRK","HTG","HUF","IDR","ILS","INR","IQD","IRR","ISK","JMD","JOD","JPY","KES","KGS","KHR","KMF","KPW","KRW","KWD","KYD","KZT","LAK",
-    "LBP","LKR","LRD","LSL","LYD","MAD","MDL","MGA","MKD","MMK","MNT","MOP","MRU","MUR","MVR","MWK","MXN","MYR","MZN","NAD","NGN","NIO","NOK","NPR","NZD",
-    "OMR","PAB","PEN","PGK","PHP","PKR","PLN","PYG","QAR","RON","RSD","RUB","RWF","SAR","SBD","SCR","SDG","SEK","SGD","SHP","SLL","SOS","SRD","SSP","STD",
-    "SYP","SZL","THB","TJS","TMT","TND","TOP","TRY","TTD","TWD","TZS","UAH","UGX","USD","UYU","UZS","VND","VUV","WST","XAF","XCD","XOF","XPF","YER","ZAR","ZMW","ZWL"
-]
+min_limit_thresholds = parse_thresholds(MIN_LIMIT_THRESHOLDS_ENV, currency_list)
 
-def _fetch_page_raw_internal(fiat, pay_type, trade_type, page, rows=ROWS_PER_REQUEST):
-    # sends payTypes: [] when pay_type is falsy -> fetch all payment methods (used by discovery & counting)
-    payload = {
-        "asset": ASSET,
-        "fiat": fiat,
-        "tradeType": trade_type,
-        "page": page,
-        "rows": rows,
-        "merchantCheck": False,
-        "publisherType": None
-    }
-    if pay_type:
-        payload["payTypes"] = [pay_type]
+pairs_to_monitor = []
+if PAIRS_ENV:
+    pairs_to_monitor = parse_pairs_env(PAIRS_ENV, min_limit_thresholds, payment_methods_map)
+else:
+    if SELECTED_CURRENCY == "ALL":
+        for cur in currency_list:
+            methods = payment_methods_map.get(cur, [])
+            for m in methods:
+                pairs_to_monitor.append((cur, m, min_limit_thresholds.get(cur, float("inf"))))
     else:
-        payload["payTypes"] = []
+        cur = SELECTED_CURRENCY
+        methods = payment_methods_map.get(cur, [])
+        if not methods:
+            logging.error(f"No methods for {cur}. Exiting.")
+            raise SystemExit(1)
+        if SELECTED_METHOD and SELECTED_METHOD.upper() != "ALL":
+            if SELECTED_METHOD not in methods:
+                logging.error(f"Method {SELECTED_METHOD} not valid for {cur}. Exiting.")
+                raise SystemExit(1)
+            methods = [SELECTED_METHOD]
+        for m in methods:
+            pairs_to_monitor.append((cur, m, min_limit_thresholds.get(cur, float("inf"))))
+
+if not pairs_to_monitor:
+    logging.error("No currency/payment pairs selected. Exiting.")
+    raise SystemExit(1)
+
+# ---------------------- HTTP session ----------------------
+session = requests.Session()
+retries = Retry(total=3, backoff_factor=0.3, status_forcelist=[429,500,502,503,504])
+session.mount("https://", HTTPAdapter(max_retries=retries))
+HEADERS = {"Content-Type": "application/json", "User-Agent": "Mozilla/5.0 (compatible; ArbitrageChecker/1.0)"}
+
+# ---------------------- fetch ----------------------
+def fetch_page_raw(fiat, pay_type, trade_type, page, rows=ROWS_PER_REQUEST):
+    payload = {"asset": "USDT","fiat": fiat,"tradeType": trade_type,"payTypes": [pay_type],"page": page,"rows": rows}
     try:
         r = session.post(BINANCE_P2P_URL, json=payload, headers=HEADERS, timeout=TIMEOUT)
         r.raise_for_status()
         return r.json().get("data") or []
     except Exception as e:
-        logging.debug(f"Network error (fetch) {fiat} {pay_type} {trade_type} p{page}: {e}")
+        logging.debug(f"Network error {fiat} {pay_type} {trade_type} p{page}: {e}")
         return []
 
-# backwards-compatible name
-fetch_page_raw = _fetch_page_raw_internal
-
-def discover_payment_methods_for_fiat(fiat, pages=DISCOVERY_PAGES):
-    """
-    tries a few pages (BUY and SELL) and collects unique method identifiers/names found in adv.tradeMethods
-    """
-    found = set()
-    for trade_type in ("BUY", "SELL"):
-        for p in range(1, pages + 1):
-            items = fetch_page_raw(fiat, None, trade_type, p, rows=ROWS_PER_REQUEST)
-            if not items:
-                break
-            for entry in items:
-                adv = entry.get("adv") or {}
-                for tm in adv.get("tradeMethods", []) or []:
-                    if isinstance(tm, dict):
-                        # different keys seen in responses
-                        for k in ("identifier", "tradeMethodName", "payType"):
-                            v = tm.get(k)
-                            if v:
-                                found.add(str(v).strip())
-            time.sleep(SLEEP_BETWEEN_PAGES)
-    return sorted(found)
-
-def discover_all_fiats_and_methods(fiat_candidates=None, max_fiats=None):
-    """
-    Returns dict: fiat_code -> [method1, method2, ...]
-    Only keeps fiats that returned at least one ad (non-empty methods).
-    """
-    if fiat_candidates is None:
-        fiat_candidates = FIAT_CANDIDATES
-    mapping = {}
-    checked = 0
-    for fiat in fiat_candidates:
-        if max_fiats and checked >= max_fiats:
+def find_first_ad(fiat, pay_type, trade_type, page_limit_threshold, rows=ROWS_PER_REQUEST):
+    for page in range(1, MAX_SCAN_PAGES + 1):
+        items = fetch_page_raw(fiat, pay_type, trade_type, page, rows=rows)
+        if not items:
             break
-        methods = discover_payment_methods_for_fiat(fiat, pages=DISCOVERY_PAGES)
-        if methods:
-            mapping[fiat] = methods
-            logging.info(f"Discovered {len(methods)} methods for {fiat}")
-            checked += 1
-        # small sleep to be polite
-        time.sleep(0.01)
-    return mapping
+        for entry in items:
+            adv = entry.get("adv") or {}
+            try:
+                price = float(adv.get("price") or 0)
+                min_lim = float(adv.get("minSingleTransAmount") or 0)
+                max_lim = float(adv.get("dynamicMaxSingleTransAmount") or 0)
+            except Exception:
+                continue
+            if min_lim <= page_limit_threshold:
+                return {"trade_type": trade_type,"currency": fiat,"payment_method": pay_type,
+                        "price": price,"min_limit": min_lim,"max_limit": max_lim}
+        time.sleep(SLEEP_BETWEEN_PAGES)
+    return None
 
 # ---------------------- messaging ----------------------
 def format_currency_flag(cur):
-    flags = {"EGP": "🇪🇬","GBP": "🇬🇧","EUR": "🇪🇺","USD": "🇺🇸", "SAR": "🇸🇦"}
+    flags = {"EGP": "🇪🇬","GBP": "🇬🇧","EUR": "🇪🇺","USD": "🇺🇸"}
     return flags.get(cur, "")
 
+# sendMessage / sendPhoto helper: robust attempts (URL -> upload -> fallback text)
 def send_telegram_alert(message):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         logging.info("Telegram token/chat not set; skipping send. Message preview:\n" + message)
         return
 
+    # Telegram caption limit for photos is 1024 characters
     caption = message if len(message) <= 1024 else (message[:1020] + "...")
     photo_url = TELEGRAM_IMAGE_URL or None
 
+    # 1) Try sendPhoto with photo URL (form-data)
     if photo_url:
         try:
             sendphoto_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
@@ -202,6 +188,7 @@ def send_telegram_alert(message):
         except Exception as e:
             logging.warning(f"sendPhoto(via URL) exception: {e}")
 
+        # 2) Try download image and upload as multipart/form-data (more reliable)
         try:
             img_resp = session.get(photo_url, timeout=10)
             img_resp.raise_for_status()
@@ -221,6 +208,7 @@ def send_telegram_alert(message):
         except Exception as e:
             logging.warning(f"sendPhoto(upload) exception: {e}")
 
+    # 3) Fallback to sendMessage (text only)
     try:
         sendmsg_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         payload2 = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML", "disable_web_page_preview": True}
@@ -230,6 +218,7 @@ def send_telegram_alert(message):
     except Exception as e:
         logging.error(f"Failed to send Telegram message: {e}")
 
+# ---------------------- message builders (correct order) ----------------------
 ZOOZ_LINK = 'https://zoozfx.com'
 ZOOZ_HTML = f'©️<a href="{ZOOZ_LINK}">ZoozFX</a>'
 
@@ -341,90 +330,16 @@ def should_send_update(pair_state, new_spread, new_buy, new_sell):
 
     return False
 
-# ---------------------- utility for matching payment methods in adv ----------------------
-def _normalize(s):
-    return str(s).strip().lower() if s is not None else ""
-
-def adv_has_method(adv, method_name):
-    # Normalize
-    target = method_name.strip().lower().replace(" ", "")
-    
-    for tm in adv.get("tradeMethods", []):
-        for key in ("identifier", "tradeMethodName"):
-            val = tm.get(key, "")
-            if val and val.strip().lower().replace(" ", "") == target:
-                return True
-    return False
-
-
-def count_ads_for_method(fiat, method, trade_type, max_pages=MAX_SCAN_PAGES, rows=ROWS_PER_REQUEST, needed=MIN_ADS_PER_SIDE):
-    """
-    Count ads (no min-limit condition) for a specific fiat+method+side.
-    Stop early when count >= needed.
-    """
-    cnt = 0
-    for p in range(1, max_pages + 1):
-        items = fetch_page_raw(fiat, None, trade_type, p, rows=rows)
-        if not items:
-            break
-        for entry in items:
-            adv = entry.get("adv") or {}
-            if adv_has_method(adv, method):
-                cnt += 1
-                if cnt >= needed:
-                    return cnt
-        time.sleep(SLEEP_BETWEEN_PAGES)
-    return cnt
-
-def find_first_ad(fiat, pay_type, trade_type, page_limit_threshold, rows=ROWS_PER_REQUEST):
-    """
-    return first ad (price,min,max) that meets minSingleTransAmount <= page_limit_threshold
-    (same behavior as original).
-    """
-    for page in range(1, MAX_SCAN_PAGES + 1):
-        items = fetch_page_raw(fiat, pay_type, trade_type, page, rows=rows)
-        if not items:
-            break
-        for entry in items:
-            adv = entry.get("adv") or {}
-            try:
-                price = float(adv.get("price") or 0)
-                min_lim = float(adv.get("minSingleTransAmount") or 0)
-                max_lim = float(adv.get("dynamicMaxSingleTransAmount") or adv.get("maxSingleTransAmount") or 0)
-            except Exception:
-                continue
-            if min_lim <= page_limit_threshold:
-                return {"trade_type": trade_type,"currency": fiat,"payment_method": pay_type,
-                        "price": price,"min_limit": min_lim,"max_limit": max_lim}
-        time.sleep(SLEEP_BETWEEN_PAGES)
-    return None
-
 # ---------------------- core processing ----------------------
-# some manual aliases (keep existing behavior for Skrill variants)
 paytype_variants_map = {"SkrillMoneybookers": ["SkrillMoneybookers","Skrill","Skrill (Moneybookers)"]}
 
 def process_pair(currency, method, threshold):
-    """
-    For a given currency + method (method is one of the discovered method strings),
-    1) ensure there are at least MIN_ADS_PER_SIDE buy ads and MIN_ADS_PER_SIDE sell ads that advertise that method (regardless of min limit)
-    2) if condition satisfied, find first BUY/SELL ads that meet the min limit threshold and compute spread
-    3) proceed with alerts as before
-    """
-    # try variants if present in map (keeps backward compatibility)
     variants = paytype_variants_map.get(method, [method])
     for variant in variants:
-        # 0) check counts (regardless of min limits)
-        buy_count = count_ads_for_method(currency, variant, "BUY", needed=MIN_ADS_PER_SIDE)
-        sell_count = count_ads_for_method(currency, variant, "SELL", needed=MIN_ADS_PER_SIDE)
-        if buy_count < MIN_ADS_PER_SIDE or sell_count < MIN_ADS_PER_SIDE:
-            logging.info(f"{currency} {variant}: insufficient ads (buy {buy_count} / sell {sell_count}) - need >= {MIN_ADS_PER_SIDE}. Skip.")
-            continue
-
-        # 1) find first ad on each side that respects the min limit threshold
         buy = find_first_ad(currency, variant, "BUY", threshold)
         sell = find_first_ad(currency, variant, "SELL", threshold)
         if not buy or not sell:
-            logging.info(f"{currency} {variant}: couldn't find both sides meeting min limit {threshold}. Skip.")
+            logging.info(f"{currency} {variant}: missing side. Skip.")
             continue
 
         try:
@@ -433,7 +348,7 @@ def process_pair(currency, method, threshold):
             logging.warning(f"Spread error {currency} {variant}: {e}")
             continue
 
-        pay_friendly = variant  # we can map to nicer name if desired
+        pay_friendly = friendly_pay_names.get(variant, variant)
         logging.info(f"{currency} {variant}: buy(display) {sell['price']:.4f} sell(display) {buy['price']:.4f} spread {spread_percent:.2f}%")
 
         pair_key = f"{currency}|{variant}"
@@ -468,63 +383,18 @@ def process_pair(currency, method, threshold):
                 set_active_state_snapshot(pair_key, active=False, last_spread=spread_percent,
                                           last_buy_price=sell["price"], last_sell_price=buy["price"], mark_sent=False)
 
-        # once we processed a matching variant, break (don't try other synonyms)
         break
 
-# ---------------------- main loop & setup ----------------------
-def build_pairs_to_monitor(discovered_map):
-    """
-    Build pairs_to_monitor list of tuples (cur, method, min_threshold)
-    Uses PAIRS_ENV / SELECTED_CURRENCY / SELECTED_METHOD logic similar to original,
-    but with discovered_map as source of available methods for each fiat.
-    """
-    thresholds_defaults = {k: DEFAULT_MIN_LIMIT for k in discovered_map.keys()}
-    min_limit_thresholds = parse_thresholds(MIN_LIMIT_THRESHOLDS_ENV, thresholds_defaults, default_value=DEFAULT_MIN_LIMIT)
-
-    pairs = []
-    if PAIRS_ENV:
-        pairs = parse_pairs_env(PAIRS_ENV, min_limit_thresholds, discovered_map)
-    else:
-        if SELECTED_CURRENCY == "ALL":
-            for cur, methods in discovered_map.items():
-                for m in methods:
-                    pairs.append((cur, m, min_limit_thresholds.get(cur, DEFAULT_MIN_LIMIT)))
-        else:
-            cur = SELECTED_CURRENCY
-            methods = discovered_map.get(cur, [])
-            if not methods:
-                logging.error(f"No methods discovered for {cur}. Exiting.")
-                raise SystemExit(1)
-            if SELECTED_METHOD and SELECTED_METHOD.upper() != "ALL":
-                if SELECTED_METHOD not in methods:
-                    logging.error(f"Method {SELECTED_METHOD} not valid for {cur}. Exiting.")
-                    raise SystemExit(1)
-                methods = [SELECTED_METHOD]
-            for m in methods:
-                pairs.append((cur, m, min_limit_thresholds.get(cur, DEFAULT_MIN_LIMIT)))
-    return pairs
-
+# ---------------------- main loop ----------------------
 def run_monitor_loop():
-    logging.info("Starting discovery of available fiats & payment methods on Binance P2P (this runs once on startup)...")
-    discovered = discover_all_fiats_and_methods(FIAT_CANDIDATES)
-    if not discovered:
-        logging.error("No fiats/methods discovered from Binance P2P. Exiting.")
-        raise SystemExit(1)
-
-    pairs = build_pairs_to_monitor(discovered)
-
-    if not pairs:
-        logging.error("No currency/payment pairs selected after discovery. Exiting.")
-        raise SystemExit(1)
-
-    logging.info(f"Monitoring {len(pairs)} pairs. Every {REFRESH_EVERY}s")
+    logging.info(f"Monitoring: {pairs_to_monitor}. Every {REFRESH_EVERY}s")
     logging.info(f"Threshold: {Profit_Threshold_percent}%. Update-any={ALERT_UPDATE_ON_ANY_CHANGE}, "
                  f"min-delta={ALERT_UPDATE_MIN_DELTA_PERCENT}%, price-delta={ALERT_UPDATE_PRICE_CHANGE_PERCENT}%")
     try:
         while True:
             start_ts = time.time()
-            with ThreadPoolExecutor(max_workers=min(len(pairs), 6)) as ex:
-                futures = [ex.submit(process_pair, cur, m, thr) for cur,m,thr in pairs]
+            with ThreadPoolExecutor(max_workers=min(len(pairs_to_monitor), 6)) as ex:
+                futures = [ex.submit(process_pair, cur, m, thr) for cur,m,thr in pairs_to_monitor]
                 for f in futures:
                     try:
                         f.result()
@@ -533,10 +403,10 @@ def run_monitor_loop():
                     time.sleep(SLEEP_BETWEEN_PAIRS)
             elapsed = time.time() - start_ts
             time.sleep(max(0, REFRESH_EVERY - elapsed))
-    except KeyboardInterrupt:
-        logging.info("Stopped by user.")
     except Exception:
         logging.exception("run_monitor_loop crashed")
+    except KeyboardInterrupt:
+        logging.info("Stopped by user.")
 
 def start_worker():
     run_monitor_loop()
