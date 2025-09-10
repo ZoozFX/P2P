@@ -1,4 +1,3 @@
-# انسخ هذا الملف كـ arbitrage_bot.py
 import os
 import time
 import logging
@@ -19,7 +18,6 @@ SLEEP_BETWEEN_PAIRS = 0.05
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-# الافتراضي שתשלח תמיד אותו תמונה אם env לא مضبوط
 TELEGRAM_IMAGE_URL = os.getenv("TELEGRAM_IMAGE_URL", "https://i.ibb.co/67XZq1QL/212.png").strip()
 
 ALERT_TTL_SECONDS = int(os.getenv("ALERT_TTL_SECONDS", "0"))
@@ -32,18 +30,84 @@ ALERT_UPDATE_ON_ANY_CHANGE = os.getenv("ALERT_UPDATE_ON_ANY_CHANGE", "0").strip(
 ALERT_UPDATE_MIN_DELTA_PERCENT = float(os.getenv("ALERT_UPDATE_MIN_DELTA_PERCENT", "0.01"))
 ALERT_UPDATE_PRICE_CHANGE_PERCENT = float(os.getenv("ALERT_UPDATE_PRICE_CHANGE_PERCENT", "0.05"))
 
-currency_list = ["EGP", "GBP", "EUR", "USD"]
+# تحديث قائمة العملات لتشمل جميع العملات المذكورة
+currency_list = ["USD", "CAD", "NZD", "AUD", "GBP", "JPY", "EUR", "EGP", "MAD", "SAR", "AED", "KWD", "DZD"]
+
+# تحديث طرق الدفع حسب العملة
 payment_methods_map = {
-    "EGP": ["InstaPay", "Vodafonecash"],
-    "GBP": ["SkrillMoneybookers"],
-    "EUR": ["SkrillMoneybookers"],
-    "USD": ["SkrillMoneybookers"]
+    "EGP": [
+        "Ahlibank", "alBaraka", "AlexBank", "ALMASHREQBank", "ArabAfricanBank", 
+        "ArabBank", "ArabTunisianBank", "AraratBank", "BANK", "BankAlEtihad", 
+        "BankTransferMena", "BanqueduCaire", "BanqueMisr", "Cashapp", "CIB", 
+        "CIBBank", "CreditAgricole", "EasyPay", "EmiratesNBD", "EtisalatCash", 
+        "FirstIraqiBank", "FPS", "HSBCBankEgypt", "InstaPay", "KFH", "klivvr", 
+        "NBE", "NBK", "OrangeCash", "OrangeMoney", "qaheracash", "QatarNationalBank", 
+        "QNB", "SpecificBank", "SWIFT", "telda", "Vodafonecash", "wepay", 
+        "WesternUnion", "ZAINCASH"
+    ],
+    # باقي العملات تستخدم طرق الدفع التالية
+    "USD": ["SkrillMoneybookers", "NETELLER", "AirTM", "DukascopyBank"],
+    "CAD": ["SkrillMoneybookers", "NETELLER", "AirTM", "DukascopyBank"],
+    "NZD": ["SkrillMoneybookers", "NETELLER", "AirTM", "DukascopyBank"],
+    "AUD": ["SkrillMoneybookers", "NETELLER", "AirTM", "DukascopyBank"],
+    "GBP": ["SkrillMoneybookers", "NETELLER", "AirTM", "DukascopyBank"],
+    "JPY": ["SkrillMoneybookers", "NETELLER", "AirTM", "DukascopyBank"],
+    "EUR": ["SkrillMoneybookers", "NETELLER", "AirTM", "DukascopyBank"],
+    "MAD": ["SkrillMoneybookers", "NETELLER", "AirTM", "DukascopyBank"],
+    "SAR": ["SkrillMoneybookers", "NETELLER", "AirTM", "DukascopyBank"],
+    "AED": ["SkrillMoneybookers", "NETELLER", "AirTM", "DukascopyBank"],
+    "KWD": ["SkrillMoneybookers", "NETELLER", "AirTM", "DukascopyBank"],
+    "DZD": ["SkrillMoneybookers", "NETELLER", "AirTM", "DukascopyBank"]
 }
+
 friendly_pay_names = {
     "SkrillMoneybookers": "Skrill",
     "Skrill": "Skrill",
     "InstaPay": "InstaPay",
-    "Vodafonecash": "Vodafonecash"
+    "Vodafonecash": "Vodafonecash",
+    "NETELLER": "NETELLER",
+    "AirTM": "AirTM",
+    "DukascopyBank": "Dukascopy Bank",
+    "Ahlibank": "Ahlibank",
+    "alBaraka": "alBaraka",
+    "AlexBank": "AlexBank",
+    "ALMASHREQBank": "ALMASHREQ Bank",
+    "ArabAfricanBank": "Arab African Bank",
+    "ArabBank": "Arab Bank",
+    "ArabTunisianBank": "Arab Tunisian Bank",
+    "AraratBank": "Ararat Bank",
+    "BANK": "BANK",
+    "BankAlEtihad": "Bank Al Etihad",
+    "BankTransferMena": "Bank Transfer Mena",
+    "BanqueduCaire": "Banque du Caire",
+    "BanqueMisr": "Banque Misr",
+    "Cashapp": "Cash App",
+    "CIB": "CIB",
+    "CIBBank": "CIB Bank",
+    "CreditAgricole": "Credit Agricole",
+    "EasyPay": "EasyPay",
+    "EmiratesNBD": "Emirates NBD",
+    "EtisalatCash": "Etisalat Cash",
+    "FirstIraqiBank": "First Iraqi Bank",
+    "FPS": "FPS",
+    "HSBCBankEgypt": "HSBC Bank Egypt",
+    "InstaPay": "InstaPay",
+    "KFH": "KFH",
+    "klivvr": "klivvr",
+    "NBE": "NBE",
+    "NBK": "NBK",
+    "OrangeCash": "Orange Cash",
+    "OrangeMoney": "Orange Money",
+    "qaheracash": "qahera cash",
+    "QatarNationalBank": "Qatar National Bank",
+    "QNB": "QNB",
+    "SpecificBank": "Specific Bank",
+    "SWIFT": "SWIFT",
+    "telda": "telda",
+    "Vodafonecash": "Vodafone Cash",
+    "wepay": "wepay",
+    "WesternUnion": "Western Union",
+    "ZAINCASH": "ZAIN CASH"
 }
 
 PAIRS_ENV = os.getenv("PAIRS", "").strip()
@@ -157,20 +221,22 @@ def find_first_ad(fiat, pay_type, trade_type, page_limit_threshold, rows=ROWS_PE
 
 # ---------------------- messaging ----------------------
 def format_currency_flag(cur):
-    flags = {"EGP": "🇪🇬","GBP": "🇬🇧","EUR": "🇪🇺","USD": "🇺🇸"}
+    flags = {
+        "EGP": "🇪🇬", "GBP": "🇬🇧", "EUR": "🇪🇺", "USD": "🇺🇸",
+        "CAD": "🇨🇦", "NZD": "🇳🇿", "AUD": "🇦🇺", "JPY": "🇯🇵",
+        "MAD": "🇲🇦", "SAR": "🇸🇦", "AED": "🇦🇪", "KWD": "🇰🇼",
+        "DZD": "🇩🇿"
+    }
     return flags.get(cur, "")
 
-# sendMessage / sendPhoto helper: robust attempts (URL -> upload -> fallback text)
 def send_telegram_alert(message):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         logging.info("Telegram token/chat not set; skipping send. Message preview:\n" + message)
         return
 
-    # Telegram caption limit for photos is 1024 characters
     caption = message if len(message) <= 1024 else (message[:1020] + "...")
     photo_url = TELEGRAM_IMAGE_URL or None
 
-    # 1) Try sendPhoto with photo URL (form-data)
     if photo_url:
         try:
             sendphoto_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
@@ -188,7 +254,6 @@ def send_telegram_alert(message):
         except Exception as e:
             logging.warning(f"sendPhoto(via URL) exception: {e}")
 
-        # 2) Try download image and upload as multipart/form-data (more reliable)
         try:
             img_resp = session.get(photo_url, timeout=10)
             img_resp.raise_for_status()
@@ -208,7 +273,6 @@ def send_telegram_alert(message):
         except Exception as e:
             logging.warning(f"sendPhoto(upload) exception: {e}")
 
-    # 3) Fallback to sendMessage (text only)
     try:
         sendmsg_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         payload2 = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML", "disable_web_page_preview": True}
@@ -218,7 +282,7 @@ def send_telegram_alert(message):
     except Exception as e:
         logging.error(f"Failed to send Telegram message: {e}")
 
-# ---------------------- message builders (correct order) ----------------------
+# ---------------------- message builders ----------------------
 ZOOZ_LINK = 'https://zoozfx.com'
 ZOOZ_HTML = f'©️<a href="{ZOOZ_LINK}">ZoozFX</a>'
 
@@ -331,7 +395,53 @@ def should_send_update(pair_state, new_spread, new_buy, new_sell):
     return False
 
 # ---------------------- core processing ----------------------
-paytype_variants_map = {"SkrillMoneybookers": ["SkrillMoneybookers","Skrill","Skrill (Moneybookers)"]}
+paytype_variants_map = {
+    "SkrillMoneybookers": ["SkrillMoneybookers","Skrill","Skrill (Moneybookers)"],
+    "NETELLER": ["NETELLER"],
+    "AirTM": ["AirTM"],
+    "DukascopyBank": ["DukascopyBank"],
+    # إضافة جميع طرق الدفع للجنيه المصري
+    "Ahlibank": ["Ahlibank"],
+    "alBaraka": ["alBaraka"],
+    "AlexBank": ["AlexBank"],
+    "ALMASHREQBank": ["ALMASHREQBank"],
+    "ArabAfricanBank": ["ArabAfricanBank"],
+    "ArabBank": ["ArabBank"],
+    "ArabTunisianBank": ["ArabTunisianBank"],
+    "AraratBank": ["AraratBank"],
+    "BANK": ["BANK"],
+    "BankAlEtihad": ["BankAlEtihad"],
+    "BankTransferMena": ["BankTransferMena"],
+    "BanqueduCaire": ["BanqueduCaire"],
+    "BanqueMisr": ["BanqueMisr"],
+    "Cashapp": ["Cashapp"],
+    "CIB": ["CIB"],
+    "CIBBank": ["CIBBank"],
+    "CreditAgricole": ["CreditAgricole"],
+    "EasyPay": ["EasyPay"],
+    "EmiratesNBD": ["EmiratesNBD"],
+    "EtisalatCash": ["EtisalatCash"],
+    "FirstIraqiBank": ["FirstIraqiBank"],
+    "FPS": ["FPS"],
+    "HSBCBankEgypt": ["HSBCBankEgypt"],
+    "InstaPay": ["InstaPay"],
+    "KFH": ["KFH"],
+    "klivvr": ["klivvr"],
+    "NBE": ["NBE"],
+    "NBK": ["NBK"],
+    "OrangeCash": ["OrangeCash"],
+    "OrangeMoney": ["OrangeMoney"],
+    "qaheracash": ["qaheracash"],
+    "QatarNationalBank": ["QatarNationalBank"],
+    "QNB": ["QNB"],
+    "SpecificBank": ["SpecificBank"],
+    "SWIFT": ["SWIFT"],
+    "telda": ["telda"],
+    "Vodafonecash": ["Vodafonecash"],
+    "wepay": ["wepay"],
+    "WesternUnion": ["WesternUnion"],
+    "ZAINCASH": ["ZAINCASH"]
+}
 
 def process_pair(currency, method, threshold):
     variants = paytype_variants_map.get(method, [method])
