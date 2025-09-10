@@ -120,7 +120,9 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 
 # ---------------------- helpers ----------------------
 def parse_thresholds(env_str, defaults):
-    out = {k: float("inf") for k in defaults}
+    DEFAULT_MIN_LIMIT = float(os.getenv("DEFAULT_MIN_LIMIT", "100"))
+    out = {k: DEFAULT_MIN_LIMIT for k in defaults}
+
     if not env_str:
         return out
     parts = [p.strip() for p in env_str.replace(",", ";").split(";") if p.strip()]
