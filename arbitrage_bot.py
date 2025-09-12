@@ -525,20 +525,21 @@ def run_monitor_loop():
     try:
         while True:
             start_ts = time.time()
-            with ThreadPoolExecutor(max_workers=min(len(pairs_to_monitor), 8)) as ex:
-                futures = [ex.submit(process_pair, cur, m, thr) for cur, m, thr in pairs_to_monitor]
-                for f in futures:
-                    try:
-                        f.result()
-                    except Exception as e:
-                        logging.error(f"Proc error: {e}")
-                    time.sleep(SLEEP_BETWEEN_PAIRS)
+            for cur, m, thr in pairs_to_monitor:
+                try:
+                    process_pair(cur, m, thr)
+                except Exception as e:
+                    logging.error(f"Proc error: {e}")
+                # Delay صغير بعد كل زوج
+                time.sleep(SLEEP_BETWEEN_PAIRS)
+
             elapsed = time.time() - start_ts
             time.sleep(max(0, REFRESH_EVERY - elapsed))
     except KeyboardInterrupt:
         logging.info("Stopped by user.")
     except Exception:
         logging.exception("run_monitor_loop crashed")
+
 
 def start_worker():
     run_monitor_loop()
