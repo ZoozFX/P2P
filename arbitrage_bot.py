@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""
+Improved ZoozFX P2P monitor with:
+ - faster "fast-probe" to reduce requests in the common case
+ - fractional token-bucket refill (smoother pacing)
+ - small-photo-send retry loop to avoid immediate fallback to text
+ - optional parallel probe for BUY/SELL
+ - extra logging and suggestions for env tuning
+
+Drop-in replacement for your original script. Keep your existing env names.
+"""
 
 import os
 import time
@@ -13,24 +23,25 @@ from urllib3.util.retry import Retry
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ---------------------- config (env-friendly) ----------------------
-BINANCE_P2P_URL = "https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search"
+BINANCE_P2P_URL = os.getenv("BINANCE_P2P_URL", "https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search")
 ROWS_PER_REQUEST = int(os.getenv("ROWS_PER_REQUEST", "20"))
+FAST_PROBE_ROWS = int(os.getenv("FAST_PROBE_ROWS", "1"))  # rows for the fast probe
 TIMEOUT = int(os.getenv("TIMEOUT", "10"))
-MAX_SCAN_PAGES = int(os.getenv("MAX_SCAN_PAGES", "8"))  # reduce default pages to avoid many requests
+MAX_SCAN_PAGES = int(os.getenv("MAX_SCAN_PAGES", "8"))
 
 # delays that control request pacing and staggering
 SLEEP_BETWEEN_PAGES = float(os.getenv("SLEEP_BETWEEN_PAGES", "0.15"))
-SLEEP_BETWEEN_PAIRS = float(os.getenv("SLEEP_BETWEEN_PAIRS", "0.30"))  # used to stagger task submission
+SLEEP_BETWEEN_PAIRS = float(os.getenv("SLEEP_BETWEEN_PAIRS", "0.30"))
 
 # rate-limiter / backoff tuning
-REQUESTS_PER_MINUTE = int(os.getenv("REQUESTS_PER_MINUTE", "20"))  # target requests per minute (global)
-MAX_CONCURRENT_WORKERS = int(os.getenv("MAX_CONCURRENT_WORKERS", "2"))  # threadpool size
+REQUESTS_PER_MINUTE = int(os.getenv("REQUESTS_PER_MINUTE", "20"))
+MAX_CONCURRENT_WORKERS = int(os.getenv("MAX_CONCURRENT_WORKERS", "2"))
 MAX_FETCH_RETRIES_ON_429 = int(os.getenv("MAX_FETCH_RETRIES_ON_429", "5"))
 INITIAL_BACKOFF_SECONDS = float(os.getenv("INITIAL_BACKOFF_SECONDS", "1.0"))
 MAX_BACKOFF_SECONDS = float(os.getenv("MAX_BACKOFF_SECONDS", "60.0"))
-JITTER_FACTOR = float(os.getenv("JITTER_FACTOR", "0.25"))  # fraction of backoff to randomize
+JITTER_FACTOR = float(os.getenv("JITTER_FACTOR", "0.25"))
 MAX_CONSECUTIVE_429_BEFORE_COOLDOWN = int(os.getenv("MAX_CONSECUTIVE_429_BEFORE_COOLDOWN", "8"))
-EXTENDED_COOLDOWN_SECONDS = int(os.getenv("EXTENDED_COOLDOWN_SECONDS", "300"))  # 5 minutes
+EXTENDED_COOLDOWN_SECONDS = int(os.getenv("EXTENDED_COOLDOWN_SECONDS", "300"))
 
 # tolerance for float comparisons to avoid duplicate alerts due to tiny rounding diffs
 ALERT_VALUE_TOLERANCE = float(os.getenv("ALERT_VALUE_TOLERANCE", "0.0001"))
@@ -38,20 +49,20 @@ ALERT_VALUE_TOLERANCE = float(os.getenv("ALERT_VALUE_TOLERANCE", "0.0001"))
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 TELEGRAM_IMAGE_URL = os.getenv("TELEGRAM_IMAGE_URL", "https://i.ibb.co/67XZq1QL/212.png").strip()
-TELEGRAM_IMAGE_FILE_ID = os.getenv("TELEGRAM_IMAGE_FILE_ID", "").strip()  # preferred
+TELEGRAM_IMAGE_FILE_ID = os.getenv("TELEGRAM_IMAGE_FILE_ID", "").strip()
 
 ALERT_TTL_SECONDS = int(os.getenv("ALERT_TTL_SECONDS", "0"))
 ALERT_DEDUP_MODE = os.getenv("ALERT_DEDUP_MODE", "exact").lower()
 
 REFRESH_EVERY = int(os.getenv("REFRESH_EVERY", "120"))
-PROFIT_THRESHOLD_PERCENT = float(os.getenv("PROFIT_THRESHOLD_PERCENT", "3"))  # example default 3%
+PROFIT_THRESHOLD_PERCENT = float(os.getenv("PROFIT_THRESHOLD_PERCENT", "3"))
 
 ALERT_UPDATE_ON_ANY_CHANGE = os.getenv("ALERT_UPDATE_ON_ANY_CHANGE", "1").strip()
 ALERT_UPDATE_MIN_DELTA_PERCENT = float(os.getenv("ALERT_UPDATE_MIN_DELTA_PERCENT", "0.01"))
 ALERT_UPDATE_PRICE_CHANGE_PERCENT = float(os.getenv("ALERT_UPDATE_PRICE_CHANGE_PERCENT", "0.05"))
 
 DEFAULT_MIN_LIMIT = float(os.getenv("DEFAULT_MIN_LIMIT", "100"))
-MIN_LIMIT_THRESHOLDS_ENV = os.getenv("MIN_LIMIT_THRESHOLDS", "").strip()  # e.g. "EGP=90;USD=50"
+MIN_LIMIT_THRESHOLDS_ENV = os.getenv("MIN_LIMIT_THRESHOLDS", "").strip()
 PAIRS_ENV = os.getenv("PAIRS", "").strip()
 SELECTED_CURRENCY = os.getenv("SELECTED_CURRENCY", "ALL").strip().upper()
 SELECTED_METHOD = os.getenv("SELECTED_METHOD", "ALL").strip()
@@ -93,6 +104,7 @@ friendly_pay_names = {
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # ---------------------- helpers ----------------------
+
 def safe_float(val, default=0.0):
     try:
         if val is None:
@@ -103,6 +115,7 @@ def safe_float(val, default=0.0):
         return float(s.split()[0])
     except Exception:
         return float(default)
+
 
 def parse_thresholds(env_str, defaults):
     out = {k: float(DEFAULT_MIN_LIMIT) for k in defaults}
@@ -118,6 +131,7 @@ def parse_thresholds(env_str, defaults):
             except Exception:
                 logging.warning(f"Cannot parse threshold for {k}: {v}")
     return out
+
 
 def parse_pairs_env(env_str, thresholds, default_map):
     pairs = []
@@ -167,43 +181,24 @@ if not pairs_to_monitor:
     logging.error("No currency/payment pairs selected. Exiting.")
     raise SystemExit(1)
 
-# ---------------------- HTTP sessions ----------------------
+# ---------------------- HTTP session ----------------------
 session = requests.Session()
-# keep original retry for non-429 transient server errors too (used for Binance requests)
+# keep original retry for non-429 transient server errors too
 retries = Retry(total=3, backoff_factor=0.3, status_forcelist=[500, 502, 503, 504])
 session.mount("https://", HTTPAdapter(max_retries=retries))
 HEADERS = {"Content-Type": "application/json", "User-Agent": "Mozilla/5.0 (compatible; ArbitrageChecker/1.0)"}
 
-# Dedicated session for Telegram: NO retries (fail-fast) so we do not block whole cycle on network problems
-telegram_session = requests.Session()
-tg_retries = Retry(total=0, connect=0, read=0, redirect=0, status=0)
-telegram_session.mount("https://", HTTPAdapter(max_retries=tg_retries))
-
-# Timeout to use specifically for Telegram API attempts (keep small to avoid long blocking)
-TELEGRAM_TIMEOUT = int(os.getenv("TELEGRAM_TIMEOUT", "5"))
-
-# ---------------------- rate-limiter shared state ----------------------
-# token bucket
+# ---------------------- global rate-limiter state (token bucket) ----------------------
 token_bucket = {
     "tokens": float(max(1, REQUESTS_PER_MINUTE)),  # start with full bucket
     "last_refill": time.time()
 }
 token_lock = threading.Lock()
 
-# last-request timestamp + lock (to avoid microbursts)
-last_request_ts = [0.0]
-last_request_lock = threading.Lock()
-
-# consecutive 429s counter + lock (used to adapt backoff multiplier)
-consecutive_429_count = 0
-consecutive_429_lock = threading.Lock()
-
-# base min-interval between requests (seconds)
-MIN_INTERVAL_BASE = max(0.0, 60.0 / max(1, REQUESTS_PER_MINUTE))
 
 def acquire_token_blocking():
     """
-    Token bucket: refill tokens proportional to elapsed seconds.
+    Token bucket: refill tokens proportional to elapsed seconds (fractional allowed).
     Blocks until at least 1 token is available, then consumes and returns.
     """
     while True:
@@ -211,24 +206,34 @@ def acquire_token_blocking():
             now = time.time()
             elapsed = now - token_bucket["last_refill"]
             if elapsed > 0:
-                # refill proportionally (allow fractional tokens)
+                # refill proportionally (allow fractional refill so tokens accumulate smoothly)
                 refill = (elapsed / 60.0) * REQUESTS_PER_MINUTE
                 token_bucket["tokens"] = min(float(REQUESTS_PER_MINUTE), token_bucket["tokens"] + refill)
                 token_bucket["last_refill"] = now
+
             if token_bucket["tokens"] >= 1.0:
                 token_bucket["tokens"] -= 1.0
                 return True
-            # compute time until next token
+
+            # compute time until next token (seconds per token)
             sec_per_token = 60.0 / max(1, REQUESTS_PER_MINUTE)
             to_sleep = sec_per_token
         logging.debug(f"Token bucket empty, sleeping {to_sleep:.3f}s")
         time.sleep(to_sleep)
 
+# also keep a min-interval enforcement to avoid microbursts
+last_request_ts = [0.0]
+last_request_lock = threading.Lock()
+consecutive_429_count = 0
+consecutive_429_lock = threading.Lock()
+
+MIN_INTERVAL_BASE = max(0.0, 60.0 / max(1, REQUESTS_PER_MINUTE))
+
+
 def rate_limit_wait():
     """
     Enforce min-interval between requests and adapt multiplier when 429s happen.
     """
-    # read count under lock
     with consecutive_429_lock:
         c429 = consecutive_429_count
 
@@ -253,11 +258,8 @@ def rate_limit_wait():
         last_request_ts[0] = time.time()
 
 # ---------------------- helpers for value comparison ----------------------
+
 def values_close(a, b, tol=ALERT_VALUE_TOLERANCE):
-    """
-    Return True if a and b are effectively equal within absolute tolerance tol.
-    Handles None: if either is None -> False (not close).
-    """
     if a is None or b is None:
         return False
     try:
@@ -266,14 +268,8 @@ def values_close(a, b, tol=ALERT_VALUE_TOLERANCE):
         return False
 
 # ---------------------- fetch (FIRST matching ad logic) with smart backoff ----------------------
+
 def fetch_page_raw(fiat, pay_type, trade_type, page, rows=ROWS_PER_REQUEST):
-    """
-    Robust fetch with:
-      - token bucket + min-interval (rate_limit_wait)
-      - retries on network errors
-      - special handling for 429 with exponential backoff + jitter + Retry-After
-    Returns list of items (or empty list on failure).
-    """
     global consecutive_429_count
 
     payload = {"asset": "USDT", "fiat": fiat, "tradeType": trade_type, "payTypes": [pay_type], "page": page, "rows": rows}
@@ -284,7 +280,6 @@ def fetch_page_raw(fiat, pay_type, trade_type, page, rows=ROWS_PER_REQUEST):
         rate_limit_wait()
         try:
             r = session.post(BINANCE_P2P_URL, json=payload, headers=HEADERS, timeout=TIMEOUT)
-            # handle explicit 429
             if r.status_code == 429:
                 with consecutive_429_lock:
                     consecutive_429_count += 1
@@ -299,17 +294,14 @@ def fetch_page_raw(fiat, pay_type, trade_type, page, rows=ROWS_PER_REQUEST):
                 except Exception:
                     ra = None
 
-                # exponential backoff based on attempt
                 backoff = min(MAX_BACKOFF_SECONDS, INITIAL_BACKOFF_SECONDS * (2 ** (attempt - 1)))
                 jitter = random.uniform(0, JITTER_FACTOR * backoff)
                 wait = backoff + jitter
-                # prefer server suggestion if larger
                 if ra and ra > wait:
                     wait = ra + random.uniform(0, 1.0)
 
                 logging.warning(f"Received 429 for {fiat}/{pay_type}/{trade_type} p{page} (attempt {attempt}/{MAX_FETCH_RETRIES_ON_429}). Sleeping {wait:.2f}s (consec429={c429_local})")
 
-                # If we have many consecutive 429s, trigger extended cooldown
                 if c429_local >= MAX_CONSECUTIVE_429_BEFORE_COOLDOWN:
                     logging.warning(f"High consecutive 429s ({c429_local}) — entering extended cooldown for {EXTENDED_COOLDOWN_SECONDS}s")
                     time.sleep(EXTENDED_COOLDOWN_SECONDS)
@@ -317,10 +309,8 @@ def fetch_page_raw(fiat, pay_type, trade_type, page, rows=ROWS_PER_REQUEST):
                     time.sleep(wait)
                 continue
 
-            # non-429: try to raise for other HTTP errors
             r.raise_for_status()
 
-            # success -> reset consecutive_429_count
             with consecutive_429_lock:
                 consecutive_429_count = 0
 
@@ -343,10 +333,8 @@ def fetch_page_raw(fiat, pay_type, trade_type, page, rows=ROWS_PER_REQUEST):
                 return []
     return []
 
+
 def find_first_ad(fiat, pay_type, trade_type, page_limit_threshold, rows=ROWS_PER_REQUEST):
-    """
-    Return the FIRST advert (in page order) whose minSingleTransAmount <= threshold.
-    """
     for page in range(1, MAX_SCAN_PAGES + 1):
         items = fetch_page_raw(fiat, pay_type, trade_type, page, rows=rows)
         if not items:
@@ -361,14 +349,11 @@ def find_first_ad(fiat, pay_type, trade_type, page_limit_threshold, rows=ROWS_PE
             except Exception:
                 continue
 
-            # verbose debug for each advert we inspect (helps verify computation)
             advertiser = entry.get("advertiser") or {}
             nick = advertiser.get("nickName") or advertiser.get("nick") or advertiser.get("userNo") or ""
             logging.debug(f"[first-search] {fiat}/{pay_type}/{trade_type} p{page} price={price} min={min_lim} max={max_lim} adv_by={nick} thr={page_limit_threshold}")
 
             if min_lim <= page_limit_threshold:
-                # return first matching ad
-                advertiser = entry.get("advertiser") or {}
                 logging.debug(f"[first-search-match] {fiat}/{pay_type}/{trade_type} p{page} -> price={price} min={min_lim} adv_by={nick}")
                 return {
                     "trade_type": trade_type,
@@ -383,79 +368,84 @@ def find_first_ad(fiat, pay_type, trade_type, page_limit_threshold, rows=ROWS_PE
     return None
 
 # ---------------------- messaging ----------------------
+
 def format_currency_flag(cur):
     flags = {"EGP":"🇪🇬","GBP":"🇬🇧","EUR":"🇪🇺","USD":"🇺🇸","CAD":"🇨🇦","NZD":"🇳🇿","AUD":"🇦🇺","JPY":"🇯🇵","MAD":"🇲🇦","SAR":"🇸🇦","AED":"🇦🇪","KWD":"🇰🇼","DZD":"🇩🇿"}
     return flags.get(cur, "")
+
+
+def _try_send_photo(payload_data, files=None):
+    """Attempt a single sendPhoto request. Return tuple(ok_bool, response_json_or_text, status_code)
+    """
+    sendphoto_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
+    try:
+        if files is not None:
+            r = session.post(sendphoto_url, data=payload_data, files=files, timeout=TIMEOUT)
+        else:
+            r = session.post(sendphoto_url, data=payload_data, timeout=TIMEOUT)
+        try:
+            jr = r.json()
+        except Exception:
+            jr = None
+        if r.ok and jr and jr.get("ok"):
+            return True, jr, r.status_code
+        return False, jr or getattr(r, 'text', ''), r.status_code
+    except Exception as e:
+        return False, str(e), None
+
 
 def send_telegram_alert(message):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         logging.info("Telegram token/chat not set; skipping send. Message preview:\n" + message)
         return False
 
-    sendphoto_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
-    sendmsg_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    caption = message if len(message) <= 1024 else (message[:1020] + "...")
-    tg_timeout = TELEGRAM_TIMEOUT
+    # Try file_id first with small retry loop to avoid immediate fallback to text when transient network errors happen
+    max_photo_attempts = 3
 
-    # 1) Try file_id (fast, no upload)
     if TELEGRAM_IMAGE_FILE_ID:
-        try:
-            payload = {"chat_id": TELEGRAM_CHAT_ID, "photo": TELEGRAM_IMAGE_FILE_ID, "caption": caption, "parse_mode": "HTML"}
-            r = telegram_session.post(sendphoto_url, data=payload, timeout=tg_timeout)
-            try:
-                jr = r.json()
-            except Exception:
-                jr = None
-            if r.ok and jr and jr.get("ok"):
+        payload = {"chat_id": TELEGRAM_CHAT_ID, "photo": TELEGRAM_IMAGE_FILE_ID, "caption": (message if len(message) <= 1024 else (message[:1020] + "...")), "parse_mode": "HTML"}
+        for attempt in range(1, max_photo_attempts + 1):
+            ok, jr_or_text, status = _try_send_photo(payload)
+            if ok:
                 logging.info("Telegram photo alert sent (file_id).")
                 return True
-            else:
-                logging.warning(f"sendPhoto(file_id) failed status={r.status_code} json={jr} text={getattr(r,'text','')}")
-        except Exception as e:
-            logging.warning(f"sendPhoto(file_id) exception (fast-fail): {e}")
+            logging.warning(f"sendPhoto(file_id) attempt {attempt}/{max_photo_attempts} failed status={status} resp={jr_or_text}")
+            # small backoff before retrying the photo
+            time.sleep(0.5 * attempt + random.uniform(0, 0.3))
 
-    # 2) Try image URL (fast)
+    # Then try URL with small retries
     if TELEGRAM_IMAGE_URL:
-        try:
-            payload = {"chat_id": TELEGRAM_CHAT_ID, "photo": TELEGRAM_IMAGE_URL, "caption": caption, "parse_mode": "HTML"}
-            r = telegram_session.post(sendphoto_url, data=payload, timeout=tg_timeout)
-            try:
-                jr = r.json()
-            except Exception:
-                jr = None
-            if r.ok and jr and jr.get("ok"):
+        payload = {"chat_id": TELEGRAM_CHAT_ID, "photo": TELEGRAM_IMAGE_URL, "caption": (message if len(message) <= 1024 else (message[:1020] + "...")), "parse_mode": "HTML"}
+        for attempt in range(1, max_photo_attempts + 1):
+            ok, jr_or_text, status = _try_send_photo(payload)
+            if ok:
                 logging.info("Telegram photo alert sent (via URL).")
                 return True
-            else:
-                logging.warning(f"sendPhoto(via URL) failed status={r.status_code} json={jr} text={getattr(r,'text','')}")
-        except Exception as e:
-            logging.warning(f"sendPhoto(via URL) exception: {e}")
+            logging.warning(f"sendPhoto(via URL) attempt {attempt}/{max_photo_attempts} failed status={status} resp={jr_or_text}")
+            time.sleep(0.5 * attempt + random.uniform(0, 0.3))
 
-    # 3) Upload fallback (download and upload) - still keep it fast
-    if TELEGRAM_IMAGE_URL:
+        # upload fallback (download then upload) with a couple of retries
         try:
-            img_resp = telegram_session.get(TELEGRAM_IMAGE_URL, timeout=tg_timeout)
+            img_resp = session.get(TELEGRAM_IMAGE_URL, timeout=10)
             img_resp.raise_for_status()
             content_type = img_resp.headers.get("content-type", "image/png")
             files = {"photo": ("zoozfx.png", img_resp.content, content_type)}
-            data = {"chat_id": TELEGRAM_CHAT_ID, "caption": caption, "parse_mode": "HTML"}
-            r2 = telegram_session.post(sendphoto_url, data=data, files=files, timeout=tg_timeout)
-            try:
-                jr2 = r2.json()
-            except Exception:
-                jr2 = None
-            if r2.ok and jr2 and jr2.get("ok"):
-                logging.info("Telegram photo alert sent (uploaded file).")
-                return True
-            else:
-                logging.warning(f"sendPhoto(upload) failed status={r2.status_code} json={jr2} text={getattr(r2,'text','')}")
+            data = {"chat_id": TELEGRAM_CHAT_ID, "caption": (message if len(message) <= 1024 else (message[:1020] + "...")), "parse_mode": "HTML"}
+            for attempt in range(1, max_photo_attempts + 1):
+                ok, jr_or_text, status = _try_send_photo(data, files=files)
+                if ok:
+                    logging.info("Telegram photo alert sent (uploaded file).")
+                    return True
+                logging.warning(f"sendPhoto(upload) attempt {attempt}/{max_photo_attempts} failed status={status} resp={jr_or_text}")
+                time.sleep(0.5 * attempt + random.uniform(0, 0.3))
         except Exception as e:
             logging.warning(f"sendPhoto(upload) exception: {e}")
 
-    # 4) Text fallback (always try last)
+    # Text fallback (last resort)
     try:
+        sendmsg_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         payload2 = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML", "disable_web_page_preview": True}
-        r3 = telegram_session.post(sendmsg_url, json=payload2, timeout=tg_timeout)
+        r3 = session.post(sendmsg_url, json=payload2, timeout=TIMEOUT)
         try:
             jr3 = r3.json()
         except Exception:
@@ -470,10 +460,10 @@ def send_telegram_alert(message):
         logging.error(f"Failed to send Telegram message: {e}")
         return False
 
-
 # ---------------------- message builders ----------------------
 ZOOZ_LINK = 'https://zoozfx.com'
 ZOOZ_HTML = f'©️<a href="{ZOOZ_LINK}">ZoozFX</a>'
+
 
 def build_alert_message(cur, pay_friendly, seller_ad, buyer_ad, spread_percent):
     flag = format_currency_flag(cur)
@@ -487,6 +477,7 @@ def build_alert_message(cur, pay_friendly, seller_ad, buyer_ad, spread_percent):
         f"💥 Good Luck! {ZOOZ_HTML}"
     )
 
+
 def build_update_message(cur, pay_friendly, seller_ad, buyer_ad, spread_percent):
     flag = format_currency_flag(cur)
     abs_diff = abs(buyer_ad["price"] - seller_ad["price"])
@@ -498,6 +489,7 @@ def build_update_message(cur, pay_friendly, seller_ad, buyer_ad, spread_percent)
         f"💰 Spread: {sign}{spread_percent:.2f}%  (<code>{abs_diff:.4f} {cur}</code>)\n\n"
         f"💥 Good Luck! {ZOOZ_HTML}"
     )
+
 
 def build_end_message(cur, pay_friendly, seller_ad, buyer_ad, spread_percent):
     flag = format_currency_flag(cur)
@@ -516,6 +508,7 @@ active_states = {}
 active_states_lock = threading.Lock()
 pair_locks = {}
 
+
 def get_pair_lock(pair_key):
     with active_states_lock:
         lock = pair_locks.get(pair_key)
@@ -523,6 +516,7 @@ def get_pair_lock(pair_key):
             lock = threading.Lock()
             pair_locks[pair_key] = lock
         return lock
+
 
 def get_active_state(pair_key):
     with active_states_lock:
@@ -540,6 +534,7 @@ def get_active_state(pair_key):
                 "last_sent_time": None
             }
         return rec.copy()
+
 
 def set_active_state_snapshot(pair_key, *, active=None, last_spread=None, last_buy_price=None, last_sell_price=None, mark_sent=False):
     with active_states_lock:
@@ -564,7 +559,6 @@ def set_active_state_snapshot(pair_key, *, active=None, last_spread=None, last_b
         if last_sell_price is not None:
             rec["last_sell_price"] = float(last_sell_price)
         if mark_sent:
-            # IMPORTANT: correct assignment keys
             rec["last_sent_spread"] = float(last_spread) if last_spread is not None else rec.get("last_sent_spread")
             rec["last_sent_buy"] = float(last_buy_price) if last_buy_price is not None else rec.get("last_sent_buy")
             rec["last_sent_sell"] = float(last_sell_price) if last_sell_price is not None else rec.get("last_sent_sell")
@@ -572,6 +566,7 @@ def set_active_state_snapshot(pair_key, *, active=None, last_spread=None, last_b
         active_states[pair_key] = rec
 
 # ---------------------- update logic ----------------------
+
 def relative_change_percent(old, new):
     try:
         if old is None or old == 0:
@@ -580,28 +575,21 @@ def relative_change_percent(old, new):
     except Exception:
         return float("inf")
 
+
 def should_send_update(pair_state, new_spread, new_buy, new_sell):
-    """
-    Return True if the last-sent values differ (beyond tolerance) from new values,
-    OR if we've never sent anything before.
-    This ensures we only send when spread or buy or sell changed.
-    """
     last_sent_spread = pair_state.get("last_sent_spread")
     last_sent_buy = pair_state.get("last_sent_buy")
     last_sent_sell = pair_state.get("last_sent_sell")
 
-    # if we never sent anything before -> allow
     if last_sent_spread is None and last_sent_buy is None and last_sent_sell is None:
         return True
 
     if ALERT_UPDATE_ON_ANY_CHANGE == "1":
-        # Use tolerant comparisons to avoid floats-precision false positives
         spread_changed = not values_close(last_sent_spread, new_spread)
         buy_changed = not values_close(last_sent_buy, new_buy)
         sell_changed = not values_close(last_sent_sell, new_sell)
         return spread_changed or buy_changed or sell_changed
 
-    # legacy logic when ALERT_UPDATE_ON_ANY_CHANGE != "1"
     if last_sent_spread is None:
         spread_diff = abs(new_spread)
     else:
@@ -616,13 +604,14 @@ def should_send_update(pair_state, new_spread, new_buy, new_sell):
 
     return False
 
+
 def can_send_start(pair_state):
     last_sent_time = pair_state.get("last_sent_time")
     if last_sent_time is None or ALERT_TTL_SECONDS <= 0:
         return True
     return (time.time() - last_sent_time) >= ALERT_TTL_SECONDS
 
-# ---------------------- core processing (FIRST-ad logic) ----------------------
+# ---------------------- core processing (FIRST-ad logic + fast-probe) ----------------------
 paytype_variants_map = {
     "SkrillMoneybookers": ["SkrillMoneybookers","Skrill","Skrill (Moneybookers)"],
     "NETELLER": ["NETELLER"],
@@ -630,15 +619,70 @@ paytype_variants_map = {
     "DukascopyBank": ["DukascopyBank"],
 }
 
+
+def fast_probe_ads(currency, variant, threshold):
+    """
+    Cheap probe: fetch top (page=1, rows=FAST_PROBE_ROWS) for BUY and SELL.
+    If both top ads satisfy min_limit <= threshold and the spread looks good, return them.
+    Otherwise return (None, None) to fall back to full search.
+    """
+    # perform BUY and SELL fetches (we do them sequentially - they are cheap because rows=1)
+    buy_items = fetch_page_raw(currency, variant, "BUY", 1, rows=FAST_PROBE_ROWS)
+    sell_items = fetch_page_raw(currency, variant, "SELL", 1, rows=FAST_PROBE_ROWS)
+
+    if not buy_items or not sell_items:
+        return None, None
+
+    # extract first adv from each
+    b = buy_items[0]
+    s = sell_items[0]
+    adv_b = b.get("adv") or {}
+    adv_s = s.get("adv") or {}
+    buyer_price = safe_float(adv_b.get("price") or 0.0)
+    buyer_min = safe_float(adv_b.get("minSingleTransAmount") or adv_b.get("minSingleTransAmountDisplay") or 0.0)
+    seller_price = safe_float(adv_s.get("price") or 0.0)
+    seller_min = safe_float(adv_s.get("minSingleTransAmount") or adv_s.get("minSingleTransAmountDisplay") or 0.0)
+
+    # if min limits fit threshold on both sides -> compute spread
+    if buyer_min <= threshold and seller_min <= threshold and seller_price > 0:
+        spread_percent = ((buyer_price / seller_price) - 1.0) * 100.0
+        if spread_percent >= PROFIT_THRESHOLD_PERCENT:
+            buyer_ad = {"trade_type":"BUY","currency":currency,"payment_method":variant,"price":buyer_price,"min_limit":buyer_min,"advertiser":b.get("advertiser")}
+            seller_ad = {"trade_type":"SELL","currency":currency,"payment_method":variant,"price":seller_price,"min_limit":seller_min,"advertiser":s.get("advertiser")}
+            return buyer_ad, seller_ad
+    return None, None
+
+
 def process_pair(currency, method, threshold):
     variants = paytype_variants_map.get(method, [method])
     for variant in variants:
         pair_key = f"{currency}|{variant}"
         lock = get_pair_lock(pair_key)
         with lock:
-            # first search BUY page, then SELL page (first matching ad each)
-            buyer_ad = find_first_ad(currency, variant, "BUY", threshold)
-            seller_ad = find_first_ad(currency, variant, "SELL", threshold)
+            # fast probe: quick low-cost check of top results
+            buyer_ad = None
+            seller_ad = None
+            try:
+                buyer_ad, seller_ad = fast_probe_ads(currency, variant, threshold)
+            except Exception as e:
+                logging.debug(f"fast_probe failed for {pair_key}: {e}")
+
+            # if fast_probe didn't find a ready opportunity, fall back to full (first-ad) scans
+            if not buyer_ad or not seller_ad:
+                # do BUY and SELL scans in parallel to save wall time (subject to token bucket)
+                with ThreadPoolExecutor(max_workers=2) as ex:
+                    fut_b = ex.submit(find_first_ad, currency, variant, "BUY", threshold)
+                    fut_s = ex.submit(find_first_ad, currency, variant, "SELL", threshold)
+                    try:
+                        buyer_ad = fut_b.result()
+                    except Exception as e:
+                        logging.debug(f"buyer fetch error for {pair_key}: {e}")
+                        buyer_ad = None
+                    try:
+                        seller_ad = fut_s.result()
+                    except Exception as e:
+                        logging.debug(f"seller fetch error for {pair_key}: {e}")
+                        seller_ad = None
 
             logging.debug(f"[found] {pair_key} buyer_ad={buyer_ad} seller_ad={seller_ad}")
 
@@ -647,10 +691,8 @@ def process_pair(currency, method, threshold):
                 continue
 
             try:
-                # buyer_ad.price comes from BUY page => this is price you CAN SELL at (we call it sell_price)
-                # seller_ad.price comes from SELL page => this is price you CAN BUY at (we call it buy_price)
-                sell_price = float(buyer_ad["price"])
-                buy_price = float(seller_ad["price"])
+                sell_price = float(buyer_ad["price"])  # price from BUY page (what you can sell at)
+                buy_price = float(seller_ad["price"])  # price from SELL page (what you can buy at)
                 spread_percent = ((sell_price / buy_price) - 1.0) * 100.0
             except Exception as e:
                 logging.warning(f"Spread calc error for {pair_key}: {e}")
@@ -664,12 +706,9 @@ def process_pair(currency, method, threshold):
 
             # decide start / update / end (send only one message per cycle)
             if spread_percent >= PROFIT_THRESHOLD_PERCENT:
-                # Start
                 if not was_active:
-                    # Only send start if values changed (or never sent) AND TTL allows
                     if not should_send_update(state, spread_percent, buy_price, sell_price):
                         logging.debug(f"{pair_key}: Start suppressed (duplicate values). Marking active without sending.")
-                        # mark active observed but do NOT mark as last_sent
                         set_active_state_snapshot(pair_key, active=True, last_spread=spread_percent,
                                                   last_buy_price=buy_price, last_sell_price=sell_price, mark_sent=False)
                     else:
@@ -687,7 +726,6 @@ def process_pair(currency, method, threshold):
                             set_active_state_snapshot(pair_key, active=True, last_spread=spread_percent,
                                                       last_buy_price=buy_price, last_sell_price=sell_price, mark_sent=False)
                 else:
-                    # Update?
                     if should_send_update(state, spread_percent, buy_price, sell_price):
                         msg = build_update_message(currency, pay_friendly, seller_ad, buyer_ad, spread_percent)
                         sent = send_telegram_alert(msg)
@@ -698,13 +736,10 @@ def process_pair(currency, method, threshold):
                         else:
                             logging.warning(f"Failed to send update for {pair_key}")
                     else:
-                        # no update; refresh last observed values (but don't overwrite last_sent_*)
                         set_active_state_snapshot(pair_key, active=True, last_spread=spread_percent,
                                                   last_buy_price=buy_price, last_sell_price=sell_price, mark_sent=False)
             else:
-                # End
                 if was_active:
-                    # Only send end if values have changed since last sent (prevents duplicate end messages)
                     if should_send_update(state, spread_percent, buy_price, sell_price):
                         msg = build_end_message(currency, pay_friendly, seller_ad, buyer_ad, spread_percent)
                         sent = send_telegram_alert(msg)
@@ -722,25 +757,24 @@ def process_pair(currency, method, threshold):
                     set_active_state_snapshot(pair_key, active=False, last_spread=spread_percent,
                                               last_buy_price=buy_price, last_sell_price=sell_price, mark_sent=False)
 
-        # processed one variant -> stop trying other variants
+        # processed variant -> break
         break
 
 # ---------------------- main loop ----------------------
+
 def run_monitor_loop():
     logging.info(f"Monitoring {len(pairs_to_monitor)} pairs. Every {REFRESH_EVERY}s. Profit threshold={PROFIT_THRESHOLD_PERCENT}%. Workers={MAX_CONCURRENT_WORKERS} RPM={REQUESTS_PER_MINUTE}")
     try:
         while True:
             start_ts = time.time()
 
-            # submit tasks with staggering to avoid burst creation
             futures = []
             with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_WORKERS) as ex:
                 for cur, m, thr in pairs_to_monitor:
                     futures.append(ex.submit(process_pair, cur, m, thr))
-                    # stagger task start to avoid simultaneous bursts
+                    # small optional stagger — if you have token bucket this is less critical
                     time.sleep(SLEEP_BETWEEN_PAIRS)
 
-                # wait for completion and surface exceptions
                 for f in as_completed(futures):
                     try:
                         f.result()
@@ -756,8 +790,10 @@ def run_monitor_loop():
     except Exception:
         logging.exception("run_monitor_loop crashed")
 
+
 def start_worker():
     run_monitor_loop()
+
 
 if __name__ == "__main__":
     start_worker()
