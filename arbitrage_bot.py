@@ -167,12 +167,21 @@ if not pairs_to_monitor:
     logging.error("No currency/payment pairs selected. Exiting.")
     raise SystemExit(1)
 
-# ---------------------- HTTP session ----------------------
+# ---------------------- HTTP sessions ----------------------
 session = requests.Session()
-# keep original retry for non-429 transient server errors too
+# keep original retry for non-429 transient server errors too (used for Binance requests)
 retries = Retry(total=3, backoff_factor=0.3, status_forcelist=[500, 502, 503, 504])
 session.mount("https://", HTTPAdapter(max_retries=retries))
 HEADERS = {"Content-Type": "application/json", "User-Agent": "Mozilla/5.0 (compatible; ArbitrageChecker/1.0)"}
+
+# Dedicated session for Telegram: NO retries (fail-fast) so we do not block whole cycle on network problems
+telegram_session = requests.Session()
+tg_retries = Retry(total=0, connect=0, read=0, redirect=0, status=0)
+telegram_session.mount("https://", HTTPAdapter(max_retries=tg_retries))
+
+# Timeout to use specifically for Telegram API attempts (keep small to avoid long blocking)
+TELEGRAM_TIMEOUT = int(os.getenv("TELEGRAM_TIMEOUT", "5"))
+
 
 # ---------------------- global rate-limiter state (token bucket) ----------------------
 token_bucket = {
@@ -191,28 +200,19 @@ def acquire_token_blocking():
             now = time.time()
             elapsed = now - token_bucket["last_refill"]
             if elapsed > 0:
-                # refill proportionally
+                # refill proportionally (allow fractional tokens)
                 refill = (elapsed / 60.0) * REQUESTS_PER_MINUTE
-                if refill >= 1.0:
-                    token_bucket["tokens"] = min(float(REQUESTS_PER_MINUTE), token_bucket["tokens"] + refill)
-                    token_bucket["last_refill"] = now
+                token_bucket["tokens"] = min(float(REQUESTS_PER_MINUTE), token_bucket["tokens"] + refill)
+                token_bucket["last_refill"] = now
             if token_bucket["tokens"] >= 1.0:
                 token_bucket["tokens"] -= 1.0
                 return True
             # compute time until next token
-            # each token interval seconds = 60 / REQUESTS_PER_MINUTE
             sec_per_token = 60.0 / max(1, REQUESTS_PER_MINUTE)
             to_sleep = sec_per_token
         logging.debug(f"Token bucket empty, sleeping {to_sleep:.3f}s")
         time.sleep(to_sleep)
 
-# also keep a min-interval enforcement to avoid microbursts
-last_request_ts = [0.0]
-last_request_lock = threading.Lock()
-consecutive_429_count = 0
-consecutive_429_lock = threading.Lock()
-
-MIN_INTERVAL_BASE = max(0.0, 60.0 / max(1, REQUESTS_PER_MINUTE))
 
 def rate_limit_wait():
     """
@@ -384,12 +384,13 @@ def send_telegram_alert(message):
     sendphoto_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
     sendmsg_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     caption = message if len(message) <= 1024 else (message[:1020] + "...")
+    tg_timeout = TELEGRAM_TIMEOUT
 
-    # Try file_id first (most reliable)
+    # 1) Try file_id (fast, no upload)
     if TELEGRAM_IMAGE_FILE_ID:
         try:
             payload = {"chat_id": TELEGRAM_CHAT_ID, "photo": TELEGRAM_IMAGE_FILE_ID, "caption": caption, "parse_mode": "HTML"}
-            r = session.post(sendphoto_url, data=payload, timeout=TIMEOUT)
+            r = telegram_session.post(sendphoto_url, data=payload, timeout=tg_timeout)
             try:
                 jr = r.json()
             except Exception:
@@ -400,13 +401,13 @@ def send_telegram_alert(message):
             else:
                 logging.warning(f"sendPhoto(file_id) failed status={r.status_code} json={jr} text={getattr(r,'text','')}")
         except Exception as e:
-            logging.warning(f"sendPhoto(file_id) exception: {e}")
+            logging.warning(f"sendPhoto(file_id) exception (fast-fail): {e}")
 
-    # Then try URL
+    # 2) Try image URL (fast)
     if TELEGRAM_IMAGE_URL:
         try:
             payload = {"chat_id": TELEGRAM_CHAT_ID, "photo": TELEGRAM_IMAGE_URL, "caption": caption, "parse_mode": "HTML"}
-            r = session.post(sendphoto_url, data=payload, timeout=TIMEOUT)
+            r = telegram_session.post(sendphoto_url, data=payload, timeout=tg_timeout)
             try:
                 jr = r.json()
             except Exception:
@@ -418,14 +419,16 @@ def send_telegram_alert(message):
                 logging.warning(f"sendPhoto(via URL) failed status={r.status_code} json={jr} text={getattr(r,'text','')}")
         except Exception as e:
             logging.warning(f"sendPhoto(via URL) exception: {e}")
-        # upload fallback
+
+    # 3) Upload fallback (download and upload) - still keep it fast
+    if TELEGRAM_IMAGE_URL:
         try:
-            img_resp = session.get(TELEGRAM_IMAGE_URL, timeout=10)
+            img_resp = telegram_session.get(TELEGRAM_IMAGE_URL, timeout=tg_timeout)
             img_resp.raise_for_status()
             content_type = img_resp.headers.get("content-type", "image/png")
             files = {"photo": ("zoozfx.png", img_resp.content, content_type)}
             data = {"chat_id": TELEGRAM_CHAT_ID, "caption": caption, "parse_mode": "HTML"}
-            r2 = session.post(sendphoto_url, data=data, files=files, timeout=TIMEOUT)
+            r2 = telegram_session.post(sendphoto_url, data=data, files=files, timeout=tg_timeout)
             try:
                 jr2 = r2.json()
             except Exception:
@@ -438,10 +441,10 @@ def send_telegram_alert(message):
         except Exception as e:
             logging.warning(f"sendPhoto(upload) exception: {e}")
 
-    # Text fallback
+    # 4) Text fallback (always try last)
     try:
         payload2 = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML", "disable_web_page_preview": True}
-        r3 = session.post(sendmsg_url, json=payload2, timeout=TIMEOUT)
+        r3 = telegram_session.post(sendmsg_url, json=payload2, timeout=tg_timeout)
         try:
             jr3 = r3.json()
         except Exception:
@@ -455,6 +458,7 @@ def send_telegram_alert(message):
     except Exception as e:
         logging.error(f"Failed to send Telegram message: {e}")
         return False
+
 
 # ---------------------- message builders ----------------------
 ZOOZ_LINK = 'https://zoozfx.com'
