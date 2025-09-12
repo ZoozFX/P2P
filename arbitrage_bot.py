@@ -182,13 +182,24 @@ telegram_session.mount("https://", HTTPAdapter(max_retries=tg_retries))
 # Timeout to use specifically for Telegram API attempts (keep small to avoid long blocking)
 TELEGRAM_TIMEOUT = int(os.getenv("TELEGRAM_TIMEOUT", "5"))
 
-
-# ---------------------- global rate-limiter state (token bucket) ----------------------
+# ---------------------- rate-limiter shared state ----------------------
+# token bucket
 token_bucket = {
     "tokens": float(max(1, REQUESTS_PER_MINUTE)),  # start with full bucket
     "last_refill": time.time()
 }
 token_lock = threading.Lock()
+
+# last-request timestamp + lock (to avoid microbursts)
+last_request_ts = [0.0]
+last_request_lock = threading.Lock()
+
+# consecutive 429s counter + lock (used to adapt backoff multiplier)
+consecutive_429_count = 0
+consecutive_429_lock = threading.Lock()
+
+# base min-interval between requests (seconds)
+MIN_INTERVAL_BASE = max(0.0, 60.0 / max(1, REQUESTS_PER_MINUTE))
 
 def acquire_token_blocking():
     """
@@ -213,11 +224,11 @@ def acquire_token_blocking():
         logging.debug(f"Token bucket empty, sleeping {to_sleep:.3f}s")
         time.sleep(to_sleep)
 
-
 def rate_limit_wait():
     """
     Enforce min-interval between requests and adapt multiplier when 429s happen.
     """
+    # read count under lock
     with consecutive_429_lock:
         c429 = consecutive_429_count
 
