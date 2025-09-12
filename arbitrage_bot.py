@@ -549,7 +549,7 @@ def set_active_state_snapshot(pair_key, *, active=None, last_spread=None, last_b
         if last_sell_price is not None:
             rec["last_sell_price"] = float(last_sell_price)
         if mark_sent:
-            # IMPORTANT: correct assignment keys (fixed bug here)
+            # IMPORTANT: correct assignment keys
             rec["last_sent_spread"] = float(last_spread) if last_spread is not None else rec.get("last_sent_spread")
             rec["last_sent_buy"] = float(last_buy_price) if last_buy_price is not None else rec.get("last_sent_buy")
             rec["last_sent_sell"] = float(last_sell_price) if last_sell_price is not None else rec.get("last_sent_sell")
@@ -566,6 +566,11 @@ def relative_change_percent(old, new):
         return float("inf")
 
 def should_send_update(pair_state, new_spread, new_buy, new_sell):
+    """
+    Return True if the last-sent values differ (beyond tolerance) from new values,
+    OR if we've never sent anything before.
+    This ensures we only send when spread or buy or sell changed.
+    """
     last_sent_spread = pair_state.get("last_sent_spread")
     last_sent_buy = pair_state.get("last_sent_buy")
     last_sent_sell = pair_state.get("last_sent_sell")
@@ -579,9 +584,7 @@ def should_send_update(pair_state, new_spread, new_buy, new_sell):
         spread_changed = not values_close(last_sent_spread, new_spread)
         buy_changed = not values_close(last_sent_buy, new_buy)
         sell_changed = not values_close(last_sent_sell, new_sell)
-        if spread_changed or buy_changed or sell_changed:
-            return True
-        return False
+        return spread_changed or buy_changed or sell_changed
 
     # legacy logic when ALERT_UPDATE_ON_ANY_CHANGE != "1"
     if last_sent_spread is None:
@@ -648,19 +651,26 @@ def process_pair(currency, method, threshold):
             if spread_percent >= PROFIT_THRESHOLD_PERCENT:
                 # Start
                 if not was_active:
-                    if can_send_start(state):
-                        msg = build_alert_message(currency, pay_friendly, seller_ad, buyer_ad, spread_percent)
-                        sent = send_telegram_alert(msg)
-                        if sent:
-                            logging.info(f"Start alert sent for {pair_key} (spread {spread_percent:.2f}%)")
-                            set_active_state_snapshot(pair_key, active=True, last_spread=spread_percent,
-                                                      last_buy_price=buy_price, last_sell_price=sell_price, mark_sent=True)
-                        else:
-                            logging.warning(f"Failed to send start alert for {pair_key}")
-                    else:
-                        logging.debug(f"Start suppressed by TTL for {pair_key}")
+                    # Only send start if values changed (or never sent) AND TTL allows
+                    if not should_send_update(state, spread_percent, buy_price, sell_price):
+                        logging.debug(f"{pair_key}: Start suppressed (duplicate values). Marking active without sending.")
+                        # mark active observed but do NOT mark as last_sent
                         set_active_state_snapshot(pair_key, active=True, last_spread=spread_percent,
                                                   last_buy_price=buy_price, last_sell_price=sell_price, mark_sent=False)
+                    else:
+                        if can_send_start(state):
+                            msg = build_alert_message(currency, pay_friendly, seller_ad, buyer_ad, spread_percent)
+                            sent = send_telegram_alert(msg)
+                            if sent:
+                                logging.info(f"Start alert sent for {pair_key} (spread {spread_percent:.2f}%)")
+                                set_active_state_snapshot(pair_key, active=True, last_spread=spread_percent,
+                                                          last_buy_price=buy_price, last_sell_price=sell_price, mark_sent=True)
+                            else:
+                                logging.warning(f"Failed to send start alert for {pair_key}")
+                        else:
+                            logging.debug(f"Start suppressed by TTL for {pair_key}")
+                            set_active_state_snapshot(pair_key, active=True, last_spread=spread_percent,
+                                                      last_buy_price=buy_price, last_sell_price=sell_price, mark_sent=False)
                 else:
                     # Update?
                     if should_send_update(state, spread_percent, buy_price, sell_price):
@@ -673,20 +683,26 @@ def process_pair(currency, method, threshold):
                         else:
                             logging.warning(f"Failed to send update for {pair_key}")
                     else:
-                        # no update; refresh last observed values
+                        # no update; refresh last observed values (but don't overwrite last_sent_*)
                         set_active_state_snapshot(pair_key, active=True, last_spread=spread_percent,
                                                   last_buy_price=buy_price, last_sell_price=sell_price, mark_sent=False)
             else:
                 # End
                 if was_active:
-                    msg = build_end_message(currency, pay_friendly, seller_ad, buyer_ad, spread_percent)
-                    sent = send_telegram_alert(msg)
-                    if sent:
-                        logging.info(f"End alert sent for {pair_key} (spread {spread_percent:.2f}%)")
-                        set_active_state_snapshot(pair_key, active=False, last_spread=spread_percent,
-                                                  last_buy_price=buy_price, last_sell_price=sell_price, mark_sent=True)
+                    # Only send end if values have changed since last sent (prevents duplicate end messages)
+                    if should_send_update(state, spread_percent, buy_price, sell_price):
+                        msg = build_end_message(currency, pay_friendly, seller_ad, buyer_ad, spread_percent)
+                        sent = send_telegram_alert(msg)
+                        if sent:
+                            logging.info(f"End alert sent for {pair_key} (spread {spread_percent:.2f}%)")
+                            set_active_state_snapshot(pair_key, active=False, last_spread=spread_percent,
+                                                      last_buy_price=buy_price, last_sell_price=sell_price, mark_sent=True)
+                        else:
+                            logging.warning(f"Failed to send end alert for {pair_key}")
                     else:
-                        logging.warning(f"Failed to send end alert for {pair_key}")
+                        logging.debug(f"{pair_key}: End suppressed (duplicate values). Marking inactive without sending.")
+                        set_active_state_snapshot(pair_key, active=False, last_spread=spread_percent,
+                                                  last_buy_price=buy_price, last_sell_price=sell_price, mark_sent=False)
                 else:
                     set_active_state_snapshot(pair_key, active=False, last_spread=spread_percent,
                                               last_buy_price=buy_price, last_sell_price=sell_price, mark_sent=False)
