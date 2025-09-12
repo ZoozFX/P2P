@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Improved ZoozFX P2P monitor with:
- - faster "fast-probe" to reduce requests in the common case
- - fractional token-bucket refill (smoother pacing)
- - small-photo-send retry loop to avoid immediate fallback to text
- - optional parallel probe for BUY/SELL
- - extra logging and suggestions for env tuning
+Improved / fixed ZoozFX P2P monitor
+ - Fixes duplicate "Alert -> Update -> Alert" behaviour by adding stronger dedup / message-type tracking
+ - Adds a signature-based deduplication (uses ALERT_VALUE_TOLERANCE)
+ - Stores last_message_type and last_sent_signature in state so we never re-send a "Start" while the pair is still active
+ - Keeps original behaviour otherwise; minimal invasive changes
 
 Drop-in replacement for your original script. Keep your existing env names.
 """
@@ -152,6 +151,7 @@ def parse_pairs_env(env_str, thresholds, default_map):
             pairs.append((cur, m, thresholds.get(cur, float("inf"))))
     return pairs
 
+
 min_limit_thresholds = parse_thresholds(MIN_LIMIT_THRESHOLDS_ENV, currency_list)
 
 pairs_to_monitor = []
@@ -266,6 +266,7 @@ def values_close(a, b, tol=ALERT_VALUE_TOLERANCE):
         return math.isclose(float(a), float(b), rel_tol=0.0, abs_tol=tol)
     except Exception:
         return False
+
 
 # ---------------------- fetch (FIRST matching ad logic) with smart backoff ----------------------
 
@@ -531,12 +532,16 @@ def get_active_state(pair_key):
                 "last_sent_spread": None,
                 "last_sent_buy": None,
                 "last_sent_sell": None,
-                "last_sent_time": None
+                "last_sent_time": None,
+                # new fields for robust dedup / state tracking
+                "last_message_type": None,  # 'start','update','end'
+                "last_sent_signature": None
             }
+        # return a shallow copy so caller can't mutate shared dict
         return rec.copy()
 
 
-def set_active_state_snapshot(pair_key, *, active=None, last_spread=None, last_buy_price=None, last_sell_price=None, mark_sent=False):
+def set_active_state_snapshot(pair_key, *, active=None, last_spread=None, last_buy_price=None, last_sell_price=None, mark_sent=False, last_sent_signature=None, last_message_type=None):
     with active_states_lock:
         rec = active_states.get(pair_key) or {
             "active": False,
@@ -547,22 +552,38 @@ def set_active_state_snapshot(pair_key, *, active=None, last_spread=None, last_b
             "last_sent_spread": None,
             "last_sent_buy": None,
             "last_sent_sell": None,
-            "last_sent_time": None
+            "last_sent_time": None,
+            "last_message_type": None,
+            "last_sent_signature": None
         }
         if active is not None:
             rec["active"] = bool(active)
             rec["since"] = time.time() if active else None
         if last_spread is not None:
-            rec["last_spread"] = float(last_spread)
+            try:
+                rec["last_spread"] = float(last_spread)
+            except Exception:
+                rec["last_spread"] = last_spread
         if last_buy_price is not None:
-            rec["last_buy_price"] = float(last_buy_price)
+            try:
+                rec["last_buy_price"] = float(last_buy_price)
+            except Exception:
+                rec["last_buy_price"] = last_buy_price
         if last_sell_price is not None:
-            rec["last_sell_price"] = float(last_sell_price)
+            try:
+                rec["last_sell_price"] = float(last_sell_price)
+            except Exception:
+                rec["last_sell_price"] = last_sell_price
         if mark_sent:
+            # update last_sent_* values and time
             rec["last_sent_spread"] = float(last_spread) if last_spread is not None else rec.get("last_sent_spread")
             rec["last_sent_buy"] = float(last_buy_price) if last_buy_price is not None else rec.get("last_sent_buy")
             rec["last_sent_sell"] = float(last_sell_price) if last_sell_price is not None else rec.get("last_sent_sell")
             rec["last_sent_time"] = time.time()
+            if last_message_type is not None:
+                rec["last_message_type"] = last_message_type
+            if last_sent_signature is not None:
+                rec["last_sent_signature"] = last_sent_signature
         active_states[pair_key] = rec
 
 # ---------------------- update logic ----------------------
@@ -576,11 +597,45 @@ def relative_change_percent(old, new):
         return float("inf")
 
 
-def should_send_update(pair_state, new_spread, new_buy, new_sell):
+def compute_signature(spread, buy, sell, tol=ALERT_VALUE_TOLERANCE):
+    """Compute a lightweight signature (tuple of rounded bins) used for exact de-dup.
+    signature bins values by tolerance which avoids minor float noise causing new messages.
+    """
+    if tol <= 0:
+        # fallback to a reasonably small tolerance
+        tol = 1e-8
+    try:
+        s_bin = int(round(spread / tol))
+    except Exception:
+        s_bin = None
+    try:
+        b_bin = int(round(buy / tol))
+    except Exception:
+        b_bin = None
+    try:
+        sel_bin = int(round(sell / tol))
+    except Exception:
+        sel_bin = None
+    return (s_bin, b_bin, sel_bin)
+
+
+def should_send_update(pair_state, new_spread, new_buy, new_sell, signature=None):
+    """
+    Decide whether an update (or start) message should be sent.
+    Uses signature-based de-duplication + previous thresholds.
+    """
     last_sent_spread = pair_state.get("last_sent_spread")
     last_sent_buy = pair_state.get("last_sent_buy")
     last_sent_sell = pair_state.get("last_sent_sell")
 
+    # If signature provided and dedup mode is exact, do a quick signature check
+    if ALERT_DEDUP_MODE == 'exact' and signature is not None:
+        last_sig = pair_state.get('last_sent_signature')
+        if last_sig is not None and last_sig == signature:
+            logging.debug(f"Dedup: signature match -> suppressing send (sig={signature})")
+            return False
+
+    # initial send when nothing has been sent yet
     if last_sent_spread is None and last_sent_buy is None and last_sent_sell is None:
         return True
 
@@ -691,6 +746,7 @@ def process_pair(currency, method, threshold):
                 continue
 
             try:
+                # careful: buyer_ad is from BUY page (what you can sell at)
                 sell_price = float(buyer_ad["price"])  # price from BUY page (what you can sell at)
                 buy_price = float(seller_ad["price"])  # price from SELL page (what you can buy at)
                 spread_percent = ((sell_price / buy_price) - 1.0) * 100.0
@@ -704,10 +760,15 @@ def process_pair(currency, method, threshold):
             state = get_active_state(pair_key)
             was_active = state["active"]
 
+            # compute signature for dedup
+            current_sig = compute_signature(spread_percent, buy_price, sell_price)
+
             # decide start / update / end (send only one message per cycle)
             if spread_percent >= PROFIT_THRESHOLD_PERCENT:
+                # Opportunity exists
                 if not was_active:
-                    if not should_send_update(state, spread_percent, buy_price, sell_price):
+                    # We are not currently active -> candidate for START
+                    if not should_send_update(state, spread_percent, buy_price, sell_price, signature=current_sig):
                         logging.debug(f"{pair_key}: Start suppressed (duplicate values). Marking active without sending.")
                         set_active_state_snapshot(pair_key, active=True, last_spread=spread_percent,
                                                   last_buy_price=buy_price, last_sell_price=sell_price, mark_sent=False)
@@ -718,7 +779,7 @@ def process_pair(currency, method, threshold):
                             if sent:
                                 logging.info(f"Start alert sent for {pair_key} (spread {spread_percent:.2f}%)")
                                 set_active_state_snapshot(pair_key, active=True, last_spread=spread_percent,
-                                                          last_buy_price=buy_price, last_sell_price=sell_price, mark_sent=True)
+                                                          last_buy_price=buy_price, last_sell_price=sell_price, mark_sent=True, last_sent_signature=current_sig, last_message_type='start')
                             else:
                                 logging.warning(f"Failed to send start alert for {pair_key}")
                         else:
@@ -726,27 +787,30 @@ def process_pair(currency, method, threshold):
                             set_active_state_snapshot(pair_key, active=True, last_spread=spread_percent,
                                                       last_buy_price=buy_price, last_sell_price=sell_price, mark_sent=False)
                 else:
-                    if should_send_update(state, spread_percent, buy_price, sell_price):
+                    # already active -> candidate for UPDATE
+                    if should_send_update(state, spread_percent, buy_price, sell_price, signature=current_sig):
                         msg = build_update_message(currency, pay_friendly, seller_ad, buyer_ad, spread_percent)
                         sent = send_telegram_alert(msg)
                         if sent:
                             logging.info(f"Update alert sent for {pair_key} (spread {spread_percent:.2f}%)")
                             set_active_state_snapshot(pair_key, active=True, last_spread=spread_percent,
-                                                      last_buy_price=buy_price, last_sell_price=sell_price, mark_sent=True)
+                                                      last_buy_price=buy_price, last_sell_price=sell_price, mark_sent=True, last_sent_signature=current_sig, last_message_type='update')
                         else:
                             logging.warning(f"Failed to send update for {pair_key}")
                     else:
+                        # update suppressed but keep active state and last values
                         set_active_state_snapshot(pair_key, active=True, last_spread=spread_percent,
                                                   last_buy_price=buy_price, last_sell_price=sell_price, mark_sent=False)
             else:
+                # Not an opportunity: ensure we transition to inactive (END) when appropriate
                 if was_active:
-                    if should_send_update(state, spread_percent, buy_price, sell_price):
+                    if should_send_update(state, spread_percent, buy_price, sell_price, signature=current_sig):
                         msg = build_end_message(currency, pay_friendly, seller_ad, buyer_ad, spread_percent)
                         sent = send_telegram_alert(msg)
                         if sent:
                             logging.info(f"End alert sent for {pair_key} (spread {spread_percent:.2f}%)")
                             set_active_state_snapshot(pair_key, active=False, last_spread=spread_percent,
-                                                      last_buy_price=buy_price, last_sell_price=sell_price, mark_sent=True)
+                                                      last_buy_price=buy_price, last_sell_price=sell_price, mark_sent=True, last_sent_signature=current_sig, last_message_type='end')
                         else:
                             logging.warning(f"Failed to send end alert for {pair_key}")
                     else:
