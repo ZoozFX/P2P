@@ -74,7 +74,7 @@ friendly_pay_names = {
 }
 
 # ---------------------- logging ----------------------
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # ---------------------- helpers ----------------------
 def safe_float(val, default=0.0):
