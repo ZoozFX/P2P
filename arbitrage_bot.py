@@ -19,6 +19,8 @@ SLEEP_BETWEEN_PAIRS = 0.05
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 TELEGRAM_IMAGE_URL = os.getenv("TELEGRAM_IMAGE_URL", "https://i.ibb.co/67XZq1QL/212.png").strip()
+# New: if you provide a telegram file_id (preferred), sending image is reliable.
+TELEGRAM_IMAGE_FILE_ID = os.getenv("TELEGRAM_IMAGE_FILE_ID", "").strip()
 
 ALERT_TTL_SECONDS = int(os.getenv("ALERT_TTL_SECONDS", "0"))
 ALERT_DEDUP_MODE = os.getenv("ALERT_DEDUP_MODE", "exact").lower()
@@ -30,22 +32,20 @@ ALERT_UPDATE_ON_ANY_CHANGE = os.getenv("ALERT_UPDATE_ON_ANY_CHANGE", "0").strip(
 ALERT_UPDATE_MIN_DELTA_PERCENT = float(os.getenv("ALERT_UPDATE_MIN_DELTA_PERCENT", "0.01"))
 ALERT_UPDATE_PRICE_CHANGE_PERCENT = float(os.getenv("ALERT_UPDATE_PRICE_CHANGE_PERCENT", "0.05"))
 
-# تحديث قائمة العملات لتشمل جميع العملات المذكورة
+# update currency list and payment methods
 currency_list = ["USD", "CAD", "NZD", "AUD", "GBP", "JPY", "EUR", "EGP", "MAD", "SAR", "AED", "KWD", "DZD"]
 
-# تحديث طرق الدفع حسب العملة
 payment_methods_map = {
     "EGP": [
-        "Ahlibank", "alBaraka", "AlexBank", "ALMASHREQBank", "ArabAfricanBank", 
-        "ArabBank", "ArabTunisianBank", "AraratBank", "BANK", "BankAlEtihad", 
-        "BankTransferMena", "BanqueduCaire", "BanqueMisr", "Cashapp", "CIB", 
-        "CIBBank", "CreditAgricole", "EasyPay", "EmiratesNBD", "EtisalatCash", 
-        "FirstIraqiBank", "FPS", "HSBCBankEgypt", "InstaPay", "KFH", "klivvr", 
-        "NBE", "NBK", "OrangeCash", "OrangeMoney", "qaheracash", "QatarNationalBank", 
-        "QNB", "SpecificBank", "SWIFT", "telda", "Vodafonecash", "wepay", 
+        "Ahlibank", "alBaraka", "AlexBank", "ALMASHREQBank", "ArabAfricanBank",
+        "ArabBank", "ArabTunisianBank", "AraratBank", "BANK", "BankAlEtihad",
+        "BankTransferMena", "BanqueduCaire", "BanqueMisr", "Cashapp", "CIB",
+        "CIBBank", "CreditAgricole", "EasyPay", "EmiratesNBD", "EtisalatCash",
+        "FirstIraqiBank", "FPS", "HSBCBankEgypt", "InstaPay", "KFH", "klivvr",
+        "NBE", "NBK", "OrangeCash", "OrangeMoney", "qaheracash", "QatarNationalBank",
+        "QNB", "SpecificBank", "SWIFT", "telda", "Vodafonecash", "wepay",
         "WesternUnion", "ZAINCASH"
     ],
-    # باقي العملات تستخدم طرق الدفع التالية
     "USD": ["SkrillMoneybookers", "NETELLER", "AirTM", "DukascopyBank"],
     "CAD": ["SkrillMoneybookers", "NETELLER", "AirTM", "DukascopyBank"],
     "NZD": ["SkrillMoneybookers", "NETELLER", "AirTM", "DukascopyBank"],
@@ -91,7 +91,6 @@ friendly_pay_names = {
     "FirstIraqiBank": "First Iraqi Bank",
     "FPS": "FPS",
     "HSBCBankEgypt": "HSBC Bank Egypt",
-    "InstaPay": "InstaPay",
     "KFH": "KFH",
     "klivvr": "klivvr",
     "NBE": "NBE",
@@ -104,10 +103,10 @@ friendly_pay_names = {
     "SpecificBank": "Specific Bank",
     "SWIFT": "SWIFT",
     "telda": "telda",
-    "Vodafonecash": "Vodafone Cash",
     "wepay": "wepay",
     "WesternUnion": "Western Union",
-    "ZAINCASH": "ZAIN CASH"
+    "ZAINCASH": "ZAIN CASH",
+    "VodafoneCash": "Vodafone Cash",
 }
 
 PAIRS_ENV = os.getenv("PAIRS", "").strip()
@@ -119,6 +118,20 @@ MIN_LIMIT_THRESHOLDS_ENV = os.getenv("MIN_LIMIT_THRESHOLDS", "").strip()
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # ---------------------- helpers ----------------------
+def safe_float(val, default=0.0):
+    """Safely parse floats from strings like '1,500' or None."""
+    try:
+        if val is None:
+            return float(default)
+        if isinstance(val, (int, float)):
+            return float(val)
+        s = str(val).strip()
+        # remove commas, currency symbols and non-digit trailing chars
+        s = s.replace(",", "").split()[0]
+        return float(s)
+    except Exception:
+        return float(default)
+
 def parse_thresholds(env_str, defaults):
     DEFAULT_MIN_LIMIT = float(os.getenv("DEFAULT_MIN_LIMIT", "100"))
     out = {k: DEFAULT_MIN_LIMIT for k in defaults}
@@ -203,6 +216,10 @@ def fetch_page_raw(fiat, pay_type, trade_type, page, rows=ROWS_PER_REQUEST):
         return []
 
 def find_first_ad(fiat, pay_type, trade_type, page_limit_threshold, rows=ROWS_PER_REQUEST):
+    """
+    Search pages for the first advert whose minSingleTransAmount <= page_limit_threshold.
+    Uses safe_float to parse numeric fields.
+    """
     for page in range(1, MAX_SCAN_PAGES + 1):
         items = fetch_page_raw(fiat, pay_type, trade_type, page, rows=rows)
         if not items:
@@ -210,11 +227,13 @@ def find_first_ad(fiat, pay_type, trade_type, page_limit_threshold, rows=ROWS_PE
         for entry in items:
             adv = entry.get("adv") or {}
             try:
-                price = float(adv.get("price") or 0)
-                min_lim = float(adv.get("minSingleTransAmount") or 0)
-                max_lim = float(adv.get("dynamicMaxSingleTransAmount") or 0)
+                price = safe_float(adv.get("price") or 0.0, 0.0)
+                min_lim = safe_float(adv.get("minSingleTransAmount") or 0.0, 0.0)
+                max_lim = safe_float(adv.get("dynamicMaxSingleTransAmount") or adv.get("maxSingleTransAmount") or 0.0, 0.0)
             except Exception:
                 continue
+            # debug log for diagnostics
+            logging.debug(f"Examining ad {fiat}/{pay_type}/{trade_type} p{page} price={price} min={min_lim} threshold={page_limit_threshold}")
             if min_lim <= page_limit_threshold:
                 return {"trade_type": trade_type,"currency": fiat,"payment_method": pay_type,
                         "price": price,"min_limit": min_lim,"max_limit": max_lim}
@@ -238,10 +257,29 @@ def send_telegram_alert(message):
 
     caption = message if len(message) <= 1024 else (message[:1020] + "...")
     photo_url = TELEGRAM_IMAGE_URL or None
+    sendphoto_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
+    sendmsg_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
 
+    # 1) Try file_id approach (most reliable)
+    if TELEGRAM_IMAGE_FILE_ID:
+        try:
+            payload = {"chat_id": TELEGRAM_CHAT_ID, "photo": TELEGRAM_IMAGE_FILE_ID, "caption": caption, "parse_mode": "HTML"}
+            r = session.post(sendphoto_url, data=payload, timeout=TIMEOUT)
+            try:
+                jr = r.json()
+            except Exception:
+                jr = None
+            if r.ok and jr and jr.get("ok"):
+                logging.info("Telegram photo alert sent (file_id).")
+                return
+            else:
+                logging.warning(f"sendPhoto(file_id) failed status={r.status_code} json={jr} text={getattr(r, 'text', '')}")
+        except Exception as e:
+            logging.warning(f"sendPhoto(file_id) exception: {e}")
+
+    # 2) Try sending photo by URL (telegram fetches it)
     if photo_url:
         try:
-            sendphoto_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
             payload = {"chat_id": TELEGRAM_CHAT_ID, "photo": photo_url, "caption": caption, "parse_mode": "HTML"}
             r = session.post(sendphoto_url, data=payload, timeout=TIMEOUT)
             try:
@@ -252,10 +290,11 @@ def send_telegram_alert(message):
                 logging.info("Telegram photo alert sent (via URL).")
                 return
             else:
-                logging.warning(f"sendPhoto(via URL) failed status={r.status_code} json={jr} text={r.text}")
+                logging.warning(f"sendPhoto(via URL) failed status={r.status_code} json={jr} text={getattr(r, 'text', '')}")
         except Exception as e:
             logging.warning(f"sendPhoto(via URL) exception: {e}")
 
+        # 3) Upload the image bytes as fallback
         try:
             img_resp = session.get(photo_url, timeout=10)
             img_resp.raise_for_status()
@@ -271,12 +310,12 @@ def send_telegram_alert(message):
                 logging.info("Telegram photo alert sent (uploaded file).")
                 return
             else:
-                logging.warning(f"sendPhoto(upload) failed status={r2.status_code} json={jr2} text={r2.text}")
+                logging.warning(f"sendPhoto(upload) failed status={r2.status_code} json={jr2} text={getattr(r2, 'text', '')}")
         except Exception as e:
             logging.warning(f"sendPhoto(upload) exception: {e}")
 
+    # 4) Text fallback
     try:
-        sendmsg_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         payload2 = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML", "disable_web_page_preview": True}
         r3 = session.post(sendmsg_url, json=payload2, timeout=TIMEOUT)
         r3.raise_for_status()
@@ -288,38 +327,40 @@ def send_telegram_alert(message):
 ZOOZ_LINK = 'https://zoozfx.com'
 ZOOZ_HTML = f'©️<a href="{ZOOZ_LINK}">ZoozFX</a>'
 
-def build_alert_message(cur, pay_friendly, sell, buy, spread_percent):
+def build_alert_message(cur, pay_friendly, sell_ad, buy_ad, spread_percent):
     flag = format_currency_flag(cur)
-    abs_diff = abs(buy["price"] - sell["price"])
+    abs_diff = abs(buy_ad["price"] - sell_ad["price"])
     sign = "+" if spread_percent > 0 else ""
+    # Note: sell_ad = advert SELL (price to buy from seller)
+    #       buy_ad  = advert BUY  (price buyer will pay, i.e. you can sell to them)
     return (
         f"🚨 Alert {flag} — {cur} ({pay_friendly})\n\n"
-        f"🔴 Sell: <code>{buy['price']:.4f} {cur}</code>\n"
-        f"🟢 Buy: <code>{sell['price']:.4f} {cur}</code>\n\n"
+        f"🔴 Sell (to buyer): <code>{buy_ad['price']:.4f} {cur}</code>\n"
+        f"🟢 Buy (from seller): <code>{sell_ad['price']:.4f} {cur}</code>\n\n"
         f"💰 Spread: {sign}{spread_percent:.2f}%  (<code>{abs_diff:.4f} {cur}</code>)\n\n"
         f"💥 Good Luck! {ZOOZ_HTML}"
     )
 
-def build_update_message(cur, pay_friendly, sell, buy, spread_percent):
+def build_update_message(cur, pay_friendly, sell_ad, buy_ad, spread_percent):
     flag = format_currency_flag(cur)
-    abs_diff = abs(buy["price"] - sell["price"])
+    abs_diff = abs(buy_ad["price"] - sell_ad["price"])
     sign = "+" if spread_percent > 0 else ""
     return (
         f"🔁 Update {flag} — {cur} ({pay_friendly})\n\n"
-        f"🔴 Sell: <code>{buy['price']:.4f} {cur}</code>\n"
-        f"🟢 Buy: <code>{sell['price']:.4f} {cur}</code>\n\n"
+        f"🔴 Sell (to buyer): <code>{buy_ad['price']:.4f} {cur}</code>\n"
+        f"🟢 Buy (from seller): <code>{sell_ad['price']:.4f} {cur}</code>\n\n"
         f"💰 Spread: {sign}{spread_percent:.2f}%  (<code>{abs_diff:.4f} {cur}</code>)\n\n"
         f"💥 Good Luck! {ZOOZ_HTML}"
     )
 
-def build_end_message(cur, pay_friendly, sell, buy, spread_percent):
+def build_end_message(cur, pay_friendly, sell_ad, buy_ad, spread_percent):
     flag = format_currency_flag(cur)
-    abs_diff = abs(buy["price"] - sell["price"])
+    abs_diff = abs(buy_ad["price"] - sell_ad["price"])
     sign = "+" if spread_percent > 0 else ""
     return (
         f"✅ Ended {flag} — {cur} ({pay_friendly})\n\n"
-        f"🔴 Sell: <code>{buy['price']:.4f} {cur}</code>\n"
-        f"🟢 Buy: <code>{sell['price']:.4f} {cur}</code>\n\n"
+        f"🔴 Sell (to buyer): <code>{buy_ad['price']:.4f} {cur}</code>\n"
+        f"🟢 Buy (from seller): <code>{sell_ad['price']:.4f} {cur}</code>\n\n"
         f"💰 Spread: {sign}{spread_percent:.2f}%  (<code>{abs_diff:.4f} {cur}</code>)\n\n"
         f"💥 Good Luck! {ZOOZ_HTML}"
     )
@@ -364,7 +405,7 @@ def set_active_state_snapshot(pair_key, *, active=None, last_spread=None, last_b
 def relative_change_percent(old, new):
     try:
         if old == 0:
-            return abs(new - old) * 100.0
+            return float("inf")
         return abs((new - old) / old) * 100.0
     except Exception:
         return float("inf")
@@ -402,7 +443,7 @@ paytype_variants_map = {
     "NETELLER": ["NETELLER"],
     "AirTM": ["AirTM"],
     "DukascopyBank": ["DukascopyBank"],
-    # إضافة جميع طرق الدفع للجنيه المصري
+    # EGP payment types...
     "Ahlibank": ["Ahlibank"],
     "alBaraka": ["alBaraka"],
     "AlexBank": ["AlexBank"],
@@ -448,20 +489,24 @@ paytype_variants_map = {
 def process_pair(currency, method, threshold):
     variants = paytype_variants_map.get(method, [method])
     for variant in variants:
-        buy = find_first_ad(currency, variant, "BUY", threshold)
-        sell = find_first_ad(currency, variant, "SELL", threshold)
-        if not buy or not sell:
-            logging.info(f"{currency} {variant}: missing side. Skip.")
+        buy_ad = find_first_ad(currency, variant, "BUY", threshold)
+        sell_ad = find_first_ad(currency, variant, "SELL", threshold)
+        if not buy_ad or not sell_ad:
+            logging.debug(f"{currency} {variant}: missing side. buy_found={bool(buy_ad)} sell_found={bool(sell_ad)}. Continue variants.")
             continue
 
         try:
-            spread_percent = ((buy["price"] / sell["price"]) - 1) * 100
+            # buy_ad = advert where counterparty BUYS USDT (you can SELL to them at buy_ad['price'])
+            # sell_ad = advert where counterparty SELLS USDT (you can BUY from them at sell_ad['price'])
+            price_buy = float(buy_ad["price"])
+            price_sell = float(sell_ad["price"])
+            spread_percent = ((price_buy / price_sell) - 1) * 100
         except Exception as e:
             logging.warning(f"Spread error {currency} {variant}: {e}")
             continue
 
         pay_friendly = friendly_pay_names.get(variant, variant)
-        logging.info(f"{currency} {variant}: buy(display) {sell['price']:.4f} sell(display) {buy['price']:.4f} spread {spread_percent:.2f}%")
+        logging.info(f"{currency} {variant}: buy_ad_price={price_buy:.4f} sell_ad_price={price_sell:.4f} spread={spread_percent:.2f}% threshold={threshold} min_buy={buy_ad['min_limit']:.2f} min_sell={sell_ad['min_limit']:.2f}")
 
         pair_key = f"{currency}|{variant}"
         state = get_active_state(pair_key)
@@ -469,32 +514,33 @@ def process_pair(currency, method, threshold):
 
         if spread_percent >= Profit_Threshold_percent:
             if not was_active:
-                message = build_alert_message(currency, pay_friendly, sell, buy, spread_percent)
+                message = build_alert_message(currency, pay_friendly, sell_ad, buy_ad, spread_percent)
                 send_telegram_alert(message)
                 logging.info(f"Start alert sent for {pair_key} (spread {spread_percent:.2f}%)")
                 set_active_state_snapshot(pair_key, active=True, last_spread=spread_percent,
-                                          last_buy_price=sell["price"], last_sell_price=buy["price"], mark_sent=True)
+                                          last_buy_price=sell_ad["price"], last_sell_price=buy_ad["price"], mark_sent=True)
             else:
-                if should_send_update(state, spread_percent, sell["price"], buy["price"]):
-                    update_msg = build_update_message(currency, pay_friendly, sell, buy, spread_percent)
+                if should_send_update(state, spread_percent, sell_ad["price"], buy_ad["price"]):
+                    update_msg = build_update_message(currency, pay_friendly, sell_ad, buy_ad, spread_percent)
                     send_telegram_alert(update_msg)
                     logging.info(f"Update alert sent for {pair_key} (spread {spread_percent:.2f}%)")
                     set_active_state_snapshot(pair_key, active=True, last_spread=spread_percent,
-                                              last_buy_price=sell["price"], last_sell_price=buy["price"], mark_sent=True)
+                                              last_buy_price=sell_ad["price"], last_sell_price=buy_ad["price"], mark_sent=True)
                 else:
                     set_active_state_snapshot(pair_key, active=True, last_spread=spread_percent,
-                                              last_buy_price=sell["price"], last_sell_price=buy["price"], mark_sent=False)
+                                              last_buy_price=sell_ad["price"], last_sell_price=buy_ad["price"], mark_sent=False)
         else:
             if was_active:
-                end_msg = build_end_message(currency, pay_friendly, sell, buy, spread_percent)
+                end_msg = build_end_message(currency, pay_friendly, sell_ad, buy_ad, spread_percent)
                 send_telegram_alert(end_msg)
                 logging.info(f"End alert sent for {pair_key} (spread {spread_percent:.2f}%)")
                 set_active_state_snapshot(pair_key, active=False, last_spread=spread_percent,
-                                          last_buy_price=sell["price"], last_sell_price=buy["price"], mark_sent=False)
+                                          last_buy_price=sell_ad["price"], last_sell_price=buy_ad["price"], mark_sent=False)
             else:
                 set_active_state_snapshot(pair_key, active=False, last_spread=spread_percent,
-                                          last_buy_price=sell["price"], last_sell_price=buy["price"], mark_sent=False)
+                                          last_buy_price=sell_ad["price"], last_sell_price=buy_ad["price"], mark_sent=False)
 
+        # we've processed a valid advert-pair for this variant; stop trying other variants
         break
 
 # ---------------------- main loop ----------------------
