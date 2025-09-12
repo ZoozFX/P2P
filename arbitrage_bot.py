@@ -5,6 +5,7 @@ import os
 import time
 import logging
 import random
+import math
 import requests
 import threading
 from requests.adapters import HTTPAdapter
@@ -30,6 +31,9 @@ MAX_BACKOFF_SECONDS = float(os.getenv("MAX_BACKOFF_SECONDS", "60.0"))
 JITTER_FACTOR = float(os.getenv("JITTER_FACTOR", "0.25"))  # fraction of backoff to randomize
 MAX_CONSECUTIVE_429_BEFORE_COOLDOWN = int(os.getenv("MAX_CONSECUTIVE_429_BEFORE_COOLDOWN", "8"))
 EXTENDED_COOLDOWN_SECONDS = int(os.getenv("EXTENDED_COOLDOWN_SECONDS", "300"))  # 5 minutes
+
+# tolerance for float comparisons to avoid duplicate alerts due to tiny rounding diffs
+ALERT_VALUE_TOLERANCE = float(os.getenv("ALERT_VALUE_TOLERANCE", "0.0001"))
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -236,6 +240,19 @@ def rate_limit_wait():
             logging.debug(f"Rate limiter: sleeping {to_sleep:.3f}s to respect min interval (mult={multiplier})")
             time.sleep(to_sleep)
         last_request_ts[0] = time.time()
+
+# ---------------------- helpers for value comparison ----------------------
+def values_close(a, b, tol=ALERT_VALUE_TOLERANCE):
+    """
+    Return True if a and b are effectively equal within absolute tolerance tol.
+    Handles None: if either is None -> False (not close).
+    """
+    if a is None or b is None:
+        return False
+    try:
+        return math.isclose(float(a), float(b), rel_tol=0.0, abs_tol=tol)
+    except Exception:
+        return False
 
 # ---------------------- fetch (FIRST matching ad logic) with smart backoff ----------------------
 def fetch_page_raw(fiat, pay_type, trade_type, page, rows=ROWS_PER_REQUEST):
@@ -532,9 +549,10 @@ def set_active_state_snapshot(pair_key, *, active=None, last_spread=None, last_b
         if last_sell_price is not None:
             rec["last_sell_price"] = float(last_sell_price)
         if mark_sent:
-            rec["last_sent_spread"] = float(last_spread) if last_spread is not None else rec.get("last_spread")
-            rec["last_sent_buy"] = float(last_buy_price) if last_buy_price is not None else rec.get("last_buy_price")
-            rec["last_sent_sell"] = float(last_sell_price) if last_sell_price is not None else rec.get("last_sent_price")
+            # IMPORTANT: correct assignment keys (fixed bug here)
+            rec["last_sent_spread"] = float(last_spread) if last_spread is not None else rec.get("last_sent_spread")
+            rec["last_sent_buy"] = float(last_buy_price) if last_buy_price is not None else rec.get("last_sent_buy")
+            rec["last_sent_sell"] = float(last_sell_price) if last_sell_price is not None else rec.get("last_sent_sell")
             rec["last_sent_time"] = time.time()
         active_states[pair_key] = rec
 
@@ -552,15 +570,20 @@ def should_send_update(pair_state, new_spread, new_buy, new_sell):
     last_sent_buy = pair_state.get("last_sent_buy")
     last_sent_sell = pair_state.get("last_sent_sell")
 
+    # if we never sent anything before -> allow
     if last_sent_spread is None and last_sent_buy is None and last_sent_sell is None:
         return True
 
     if ALERT_UPDATE_ON_ANY_CHANGE == "1":
-        # compare with simple float equality is OK because values are exactly set from floats we control
-        if (last_sent_spread != new_spread) or (last_sent_buy != new_buy) or (last_sent_sell != new_sell):
+        # Use tolerant comparisons to avoid floats-precision false positives
+        spread_changed = not values_close(last_sent_spread, new_spread)
+        buy_changed = not values_close(last_sent_buy, new_buy)
+        sell_changed = not values_close(last_sent_sell, new_sell)
+        if spread_changed or buy_changed or sell_changed:
             return True
         return False
 
+    # legacy logic when ALERT_UPDATE_ON_ANY_CHANGE != "1"
     if last_sent_spread is None:
         spread_diff = abs(new_spread)
     else:
