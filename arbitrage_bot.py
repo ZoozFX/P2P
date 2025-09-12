@@ -1,3 +1,6 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 import os
 import time
 import logging
@@ -8,31 +11,41 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from concurrent.futures import ThreadPoolExecutor
 
-# ---------------------- config (from env) ----------------------
+# ---------------------- config (env-friendly) ----------------------
 BINANCE_P2P_URL = "https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search"
-ROWS_PER_REQUEST = 20
-TIMEOUT = 10
-MAX_SCAN_PAGES = 60
-SLEEP_BETWEEN_PAGES = 0.09
-SLEEP_BETWEEN_PAIRS = 0.05
+ROWS_PER_REQUEST = int(os.getenv("ROWS_PER_REQUEST", "20"))
+TIMEOUT = int(os.getenv("TIMEOUT", "10"))
+MAX_SCAN_PAGES = int(os.getenv("MAX_SCAN_PAGES", "60"))
+SLEEP_BETWEEN_PAGES = float(os.getenv("SLEEP_BETWEEN_PAGES", "0.09"))
+SLEEP_BETWEEN_PAIRS = float(os.getenv("SLEEP_BETWEEN_PAIRS", "0.05"))
 
+# Telegram / notifications
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 TELEGRAM_IMAGE_URL = os.getenv("TELEGRAM_IMAGE_URL", "https://i.ibb.co/67XZq1QL/212.png").strip()
-# New: if you provide a telegram file_id (preferred), sending image is reliable.
-TELEGRAM_IMAGE_FILE_ID = os.getenv("TELEGRAM_IMAGE_FILE_ID", "").strip()
+# Preferred: put TELEGRAM_IMAGE_FILE_ID in env. Fallback default uses the file_id you provided earlier.
+TELEGRAM_IMAGE_FILE_ID = os.getenv("TELEGRAM_IMAGE_FILE_ID",
+    "AgACAgQAAxkBAAIK5WjDxLEPnU9A8S2aMOXP_ALcDUkwAAIGyzEbU3gYUpJwXitI3gy1AQADAgADeQADNgQ"
+).strip()
 
-ALERT_TTL_SECONDS = int(os.getenv("ALERT_TTL_SECONDS", "0"))
-ALERT_DEDUP_MODE = os.getenv("ALERT_DEDUP_MODE", "exact").lower()
+ALERT_TTL_SECONDS = int(os.getenv("ALERT_TTL_SECONDS", "0"))             # allow re-alert after this many seconds
+ALERT_DEDUP_MODE = os.getenv("ALERT_DEDUP_MODE", "exact").lower()        # reserved (behavior implemented simply using TTL)
 
 REFRESH_EVERY = int(os.getenv("REFRESH_EVERY", "60"))
-Profit_Threshold_percent = float(os.getenv("PROFIT_THRESHOLD_PERCENT", "0.4"))
+PROFIT_THRESHOLD_PERCENT = float(os.getenv("PROFIT_THRESHOLD_PERCENT", "0.4"))
 
 ALERT_UPDATE_ON_ANY_CHANGE = os.getenv("ALERT_UPDATE_ON_ANY_CHANGE", "0").strip()
 ALERT_UPDATE_MIN_DELTA_PERCENT = float(os.getenv("ALERT_UPDATE_MIN_DELTA_PERCENT", "0.01"))
 ALERT_UPDATE_PRICE_CHANGE_PERCENT = float(os.getenv("ALERT_UPDATE_PRICE_CHANGE_PERCENT", "0.05"))
 
-# update currency list and payment methods
+# Minimum limits config
+DEFAULT_MIN_LIMIT = float(os.getenv("DEFAULT_MIN_LIMIT", "100"))
+MIN_LIMIT_THRESHOLDS_ENV = os.getenv("MIN_LIMIT_THRESHOLDS", "").strip()  # e.g. "EGP=90;USD=50"
+PAIRS_ENV = os.getenv("PAIRS", "").strip()
+SELECTED_CURRENCY = os.getenv("SELECTED_CURRENCY", "ALL").strip().upper()
+SELECTED_METHOD = os.getenv("SELECTED_METHOD", "ALL").strip()
+
+# ---------------------- static data ----------------------
 currency_list = ["USD", "CAD", "NZD", "AUD", "GBP", "JPY", "EUR", "EGP", "MAD", "SAR", "AED", "KWD", "DZD"]
 
 payment_methods_map = {
@@ -46,6 +59,7 @@ payment_methods_map = {
         "QNB", "SpecificBank", "SWIFT", "telda", "Vodafonecash", "wepay",
         "WesternUnion", "ZAINCASH"
     ],
+    # default list for other currencies (example list)
     "USD": ["SkrillMoneybookers", "NETELLER", "AirTM", "DukascopyBank"],
     "CAD": ["SkrillMoneybookers", "NETELLER", "AirTM", "DukascopyBank"],
     "NZD": ["SkrillMoneybookers", "NETELLER", "AirTM", "DukascopyBank"],
@@ -109,11 +123,6 @@ friendly_pay_names = {
     "VodafoneCash": "Vodafone Cash",
 }
 
-PAIRS_ENV = os.getenv("PAIRS", "").strip()
-SELECTED_CURRENCY = os.getenv("SELECTED_CURRENCY", "ALL").strip().upper()
-SELECTED_METHOD = os.getenv("SELECTED_METHOD", "ALL").strip()
-MIN_LIMIT_THRESHOLDS_ENV = os.getenv("MIN_LIMIT_THRESHOLDS", "").strip()
-
 # ---------------------- logging ----------------------
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -126,26 +135,26 @@ def safe_float(val, default=0.0):
         if isinstance(val, (int, float)):
             return float(val)
         s = str(val).strip()
-        # remove commas, currency symbols and non-digit trailing chars
-        s = s.replace(",", "").split()[0]
+        s = s.replace(",", "")
+        # strip currency symbols or extraneous chars at end (e.g. "100.00 USD")
+        parts = s.split()
+        s = parts[0]
         return float(s)
     except Exception:
         return float(default)
 
 def parse_thresholds(env_str, defaults):
-    DEFAULT_MIN_LIMIT = float(os.getenv("DEFAULT_MIN_LIMIT", "100"))
-    out = {k: DEFAULT_MIN_LIMIT for k in defaults}
-
+    out = {k: float(DEFAULT_MIN_LIMIT) for k in defaults}
     if not env_str:
         return out
+    # support "EGP=90;USD=50" or "EGP:90,USD:50"
     parts = [p.strip() for p in env_str.replace(",", ";").split(";") if p.strip()]
     for p in parts:
         if "=" in p or ":" in p:
             sep = "=" if "=" in p else ":"
             k, v = p.split(sep, 1)
-            k = k.strip().upper()
             try:
-                out[k] = float(v.strip())
+                out[k.strip().upper()] = float(v.strip())
             except Exception:
                 logging.warning(f"Cannot parse threshold for {k}: {v}")
     return out
@@ -171,6 +180,7 @@ def parse_pairs_env(env_str, thresholds, default_map):
 
 min_limit_thresholds = parse_thresholds(MIN_LIMIT_THRESHOLDS_ENV, currency_list)
 
+# ---------------------- build pairs_to_monitor ----------------------
 pairs_to_monitor = []
 if PAIRS_ENV:
     pairs_to_monitor = parse_pairs_env(PAIRS_ENV, min_limit_thresholds, payment_methods_map)
@@ -200,13 +210,13 @@ if not pairs_to_monitor:
 
 # ---------------------- HTTP session ----------------------
 session = requests.Session()
-retries = Retry(total=3, backoff_factor=0.3, status_forcelist=[429,500,502,503,504])
+retries = Retry(total=3, backoff_factor=0.3, status_forcelist=[429, 500, 502, 503, 504])
 session.mount("https://", HTTPAdapter(max_retries=retries))
 HEADERS = {"Content-Type": "application/json", "User-Agent": "Mozilla/5.0 (compatible; ArbitrageChecker/1.0)"}
 
 # ---------------------- fetch ----------------------
 def fetch_page_raw(fiat, pay_type, trade_type, page, rows=ROWS_PER_REQUEST):
-    payload = {"asset": "USDT","fiat": fiat,"tradeType": trade_type,"payTypes": [pay_type],"page": page,"rows": rows}
+    payload = {"asset": "USDT", "fiat": fiat, "tradeType": trade_type, "payTypes": [pay_type], "page": page, "rows": rows}
     try:
         r = session.post(BINANCE_P2P_URL, json=payload, headers=HEADERS, timeout=TIMEOUT)
         r.raise_for_status()
@@ -217,8 +227,8 @@ def fetch_page_raw(fiat, pay_type, trade_type, page, rows=ROWS_PER_REQUEST):
 
 def find_first_ad(fiat, pay_type, trade_type, page_limit_threshold, rows=ROWS_PER_REQUEST):
     """
-    Search pages for the first advert whose minSingleTransAmount <= page_limit_threshold.
-    Uses safe_float to parse numeric fields.
+    Scan pages for an advert whose minSingleTransAmount <= page_limit_threshold.
+    Skip ads with min > threshold. Return the first that satisfies condition or None.
     """
     for page in range(1, MAX_SCAN_PAGES + 1):
         items = fetch_page_raw(fiat, pay_type, trade_type, page, rows=rows)
@@ -228,15 +238,23 @@ def find_first_ad(fiat, pay_type, trade_type, page_limit_threshold, rows=ROWS_PE
             adv = entry.get("adv") or {}
             try:
                 price = safe_float(adv.get("price") or 0.0, 0.0)
-                min_lim = safe_float(adv.get("minSingleTransAmount") or 0.0, 0.0)
+                min_lim = safe_float(adv.get("minSingleTransAmount") or adv.get("minSingleTransAmountDisplay") or 0.0, 0.0)
                 max_lim = safe_float(adv.get("dynamicMaxSingleTransAmount") or adv.get("maxSingleTransAmount") or 0.0, 0.0)
             except Exception:
                 continue
-            # debug log for diagnostics
-            logging.debug(f"Examining ad {fiat}/{pay_type}/{trade_type} p{page} price={price} min={min_lim} threshold={page_limit_threshold}")
+            logging.debug(f"[scan] {fiat}/{pay_type}/{trade_type} p{page} price={price} min={min_lim} thr={page_limit_threshold}")
             if min_lim <= page_limit_threshold:
-                return {"trade_type": trade_type,"currency": fiat,"payment_method": pay_type,
-                        "price": price,"min_limit": min_lim,"max_limit": max_lim}
+                # return structured ad
+                advertiser = entry.get("advertiser") or {}
+                return {
+                    "trade_type": trade_type,
+                    "currency": fiat,
+                    "payment_method": pay_type,
+                    "price": price,
+                    "min_limit": min_lim,
+                    "max_limit": max_lim,
+                    "advertiser": advertiser
+                }
         time.sleep(SLEEP_BETWEEN_PAGES)
     return None
 
@@ -255,12 +273,11 @@ def send_telegram_alert(message):
         logging.info("Telegram token/chat not set; skipping send. Message preview:\n" + message)
         return
 
-    caption = message if len(message) <= 1024 else (message[:1020] + "...")
-    photo_url = TELEGRAM_IMAGE_URL or None
     sendphoto_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
     sendmsg_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    caption = message if len(message) <= 1024 else (message[:1020] + "...")
 
-    # 1) Try file_id approach (most reliable)
+    # 1) Try file_id (most reliable)
     if TELEGRAM_IMAGE_FILE_ID:
         try:
             payload = {"chat_id": TELEGRAM_CHAT_ID, "photo": TELEGRAM_IMAGE_FILE_ID, "caption": caption, "parse_mode": "HTML"}
@@ -271,16 +288,16 @@ def send_telegram_alert(message):
                 jr = None
             if r.ok and jr and jr.get("ok"):
                 logging.info("Telegram photo alert sent (file_id).")
-                return
+                return True
             else:
                 logging.warning(f"sendPhoto(file_id) failed status={r.status_code} json={jr} text={getattr(r, 'text', '')}")
         except Exception as e:
             logging.warning(f"sendPhoto(file_id) exception: {e}")
 
-    # 2) Try sending photo by URL (telegram fetches it)
-    if photo_url:
+    # 2) Try sending by URL
+    if TELEGRAM_IMAGE_URL:
         try:
-            payload = {"chat_id": TELEGRAM_CHAT_ID, "photo": photo_url, "caption": caption, "parse_mode": "HTML"}
+            payload = {"chat_id": TELEGRAM_CHAT_ID, "photo": TELEGRAM_IMAGE_URL, "caption": caption, "parse_mode": "HTML"}
             r = session.post(sendphoto_url, data=payload, timeout=TIMEOUT)
             try:
                 jr = r.json()
@@ -288,15 +305,15 @@ def send_telegram_alert(message):
                 jr = None
             if r.ok and jr and jr.get("ok"):
                 logging.info("Telegram photo alert sent (via URL).")
-                return
+                return True
             else:
                 logging.warning(f"sendPhoto(via URL) failed status={r.status_code} json={jr} text={getattr(r, 'text', '')}")
         except Exception as e:
             logging.warning(f"sendPhoto(via URL) exception: {e}")
 
-        # 3) Upload the image bytes as fallback
+        # 3) Upload image bytes as fallback
         try:
-            img_resp = session.get(photo_url, timeout=10)
+            img_resp = session.get(TELEGRAM_IMAGE_URL, timeout=10)
             img_resp.raise_for_status()
             content_type = img_resp.headers.get("content-type", "image/png")
             files = {"photo": ("zoozfx.png", img_resp.content, content_type)}
@@ -308,7 +325,7 @@ def send_telegram_alert(message):
                 jr2 = None
             if r2.ok and jr2 and jr2.get("ok"):
                 logging.info("Telegram photo alert sent (uploaded file).")
-                return
+                return True
             else:
                 logging.warning(f"sendPhoto(upload) failed status={r2.status_code} json={jr2} text={getattr(r2, 'text', '')}")
         except Exception as e:
@@ -320,52 +337,54 @@ def send_telegram_alert(message):
         r3 = session.post(sendmsg_url, json=payload2, timeout=TIMEOUT)
         r3.raise_for_status()
         logging.info("Telegram alert sent (text fallback).")
+        return True
     except Exception as e:
         logging.error(f"Failed to send Telegram message: {e}")
+        return False
 
 # ---------------------- message builders ----------------------
 ZOOZ_LINK = 'https://zoozfx.com'
 ZOOZ_HTML = f'©️<a href="{ZOOZ_LINK}">ZoozFX</a>'
 
-def build_alert_message(cur, pay_friendly, sell_ad, buy_ad, spread_percent):
+def build_alert_message(cur, pay_friendly, seller_ad, buyer_ad, spread_percent):
+    # seller_ad: advert where counterparty SELLS USDT (you BUY at seller_ad['price'])
+    # buyer_ad: advert where counterparty BUYS USDT (you SELL at buyer_ad['price'])
     flag = format_currency_flag(cur)
-    abs_diff = abs(buy_ad["price"] - sell_ad["price"])
-    sign = "+" if spread_percent > 0 else ""
-    # Note: sell_ad = advert SELL (price to buy from seller)
-    #       buy_ad  = advert BUY  (price buyer will pay, i.e. you can sell to them)
-    return (
-        f"🚨 Alert {flag} — {cur} ({pay_friendly})\n\n"
-        f"🔴 Sell (to buyer): <code>{buy_ad['price']:.4f} {cur}</code>\n"
-        f"🟢 Buy (from seller): <code>{sell_ad['price']:.4f} {cur}</code>\n\n"
-        f"💰 Spread: {sign}{spread_percent:.2f}%  (<code>{abs_diff:.4f} {cur}</code>)\n\n"
-        f"💥 Good Luck! {ZOOZ_HTML}"
-    )
-
-def build_update_message(cur, pay_friendly, sell_ad, buy_ad, spread_percent):
-    flag = format_currency_flag(cur)
-    abs_diff = abs(buy_ad["price"] - sell_ad["price"])
+    abs_diff = abs(buyer_ad["price"] - seller_ad["price"])
     sign = "+" if spread_percent > 0 else ""
     return (
-        f"🔁 Update {flag} — {cur} ({pay_friendly})\n\n"
-        f"🔴 Sell (to buyer): <code>{buy_ad['price']:.4f} {cur}</code>\n"
-        f"🟢 Buy (from seller): <code>{sell_ad['price']:.4f} {cur}</code>\n\n"
+        f"🚨 <b>Opportunity {flag} — {cur} ({pay_friendly})</b>\n\n"
+        f"🟢 Buy (from seller): <code>{seller_ad['price']:.4f} {cur}</code> (min {seller_ad['min_limit']:.2f})\n"
+        f"🔴 Sell (to buyer)  : <code>{buyer_ad['price']:.4f} {cur}</code> (min {buyer_ad['min_limit']:.2f})\n\n"
         f"💰 Spread: {sign}{spread_percent:.2f}%  (<code>{abs_diff:.4f} {cur}</code>)\n\n"
-        f"💥 Good Luck! {ZOOZ_HTML}"
+        f"{ZOOZ_HTML}"
     )
 
-def build_end_message(cur, pay_friendly, sell_ad, buy_ad, spread_percent):
+def build_update_message(cur, pay_friendly, seller_ad, buyer_ad, spread_percent):
     flag = format_currency_flag(cur)
-    abs_diff = abs(buy_ad["price"] - sell_ad["price"])
+    abs_diff = abs(buyer_ad["price"] - seller_ad["price"])
     sign = "+" if spread_percent > 0 else ""
     return (
-        f"✅ Ended {flag} — {cur} ({pay_friendly})\n\n"
-        f"🔴 Sell (to buyer): <code>{buy_ad['price']:.4f} {cur}</code>\n"
-        f"🟢 Buy (from seller): <code>{sell_ad['price']:.4f} {cur}</code>\n\n"
+        f"🔁 <b>Update {flag} — {cur} ({pay_friendly})</b>\n\n"
+        f"🟢 Buy (from seller): <code>{seller_ad['price']:.4f} {cur}</code> (min {seller_ad['min_limit']:.2f})\n"
+        f"🔴 Sell (to buyer)  : <code>{buyer_ad['price']:.4f} {cur}</code> (min {buyer_ad['min_limit']:.2f})\n\n"
         f"💰 Spread: {sign}{spread_percent:.2f}%  (<code>{abs_diff:.4f} {cur}</code>)\n\n"
-        f"💥 Good Luck! {ZOOZ_HTML}"
+        f"{ZOOZ_HTML}"
     )
 
-# ---------------------- per-pair active state + last-sent snapshot ----------------------
+def build_end_message(cur, pay_friendly, seller_ad, buyer_ad, spread_percent):
+    flag = format_currency_flag(cur)
+    abs_diff = abs(buyer_ad["price"] - seller_ad["price"])
+    sign = "+" if spread_percent > 0 else ""
+    return (
+        f"✅ <b>Ended {flag} — {cur} ({pay_friendly})</b>\n\n"
+        f"🟢 Buy (from seller): <code>{seller_ad['price']:.4f} {cur}</code> (min {seller_ad['min_limit']:.2f})\n"
+        f"🔴 Sell (to buyer)  : <code>{buyer_ad['price']:.4f} {cur}</code> (min {buyer_ad['min_limit']:.2f})\n\n"
+        f"💰 Spread: {sign}{spread_percent:.2f}%  (<code>{abs_diff:.4f} {cur}</code>)\n\n"
+        f"{ZOOZ_HTML}"
+    )
+
+# ---------------------- state tracking ----------------------
 active_states = {}
 active_states_lock = threading.Lock()
 
@@ -374,16 +393,30 @@ def get_active_state(pair_key):
         rec = active_states.get(pair_key)
         if not rec:
             return {
-                "active": False, "last_spread": None, "last_buy_price": None, "last_sell_price": None,
-                "since": None, "last_sent_spread": None, "last_sent_buy": None, "last_sent_sell": None, "last_sent_time": None
+                "active": False,
+                "last_spread": None,
+                "last_buy_price": None,
+                "last_sell_price": None,
+                "since": None,
+                "last_sent_spread": None,
+                "last_sent_buy": None,
+                "last_sent_sell": None,
+                "last_sent_time": None
             }
         return rec.copy()
 
 def set_active_state_snapshot(pair_key, *, active=None, last_spread=None, last_buy_price=None, last_sell_price=None, mark_sent=False):
     with active_states_lock:
         rec = active_states.get(pair_key) or {
-            "active": False, "last_spread": None, "last_buy_price": None, "last_sell_price": None,
-            "since": None, "last_sent_spread": None, "last_sent_buy": None, "last_sent_sell": None, "last_sent_time": None
+            "active": False,
+            "last_spread": None,
+            "last_buy_price": None,
+            "last_sell_price": None,
+            "since": None,
+            "last_sent_spread": None,
+            "last_sent_buy": None,
+            "last_sent_sell": None,
+            "last_sent_time": None
         }
         if active is not None:
             rec["active"] = bool(active)
@@ -404,7 +437,7 @@ def set_active_state_snapshot(pair_key, *, active=None, last_spread=None, last_b
 # ---------------------- update logic ----------------------
 def relative_change_percent(old, new):
     try:
-        if old == 0:
+        if old == 0 or old is None:
             return float("inf")
         return abs((new - old) / old) * 100.0
     except Exception:
@@ -415,6 +448,7 @@ def should_send_update(pair_state, new_spread, new_buy, new_sell):
     last_sent_buy = pair_state.get("last_sent_buy")
     last_sent_sell = pair_state.get("last_sent_sell")
 
+    # first time after start -> send
     if last_sent_spread is None and last_sent_buy is None and last_sent_sell is None:
         return True
 
@@ -437,6 +471,15 @@ def should_send_update(pair_state, new_spread, new_buy, new_sell):
 
     return False
 
+def can_send_start(pair_state):
+    """Apply TTL deduplication for start alerts."""
+    last_sent_time = pair_state.get("last_sent_time")
+    if last_sent_time is None or ALERT_TTL_SECONDS <= 0:
+        return True
+    if (time.time() - last_sent_time) >= ALERT_TTL_SECONDS:
+        return True
+    return False
+
 # ---------------------- core processing ----------------------
 paytype_variants_map = {
     "SkrillMoneybookers": ["SkrillMoneybookers","Skrill","Skrill (Moneybookers)"],
@@ -444,115 +487,107 @@ paytype_variants_map = {
     "AirTM": ["AirTM"],
     "DukascopyBank": ["DukascopyBank"],
     # EGP payment types...
-    "Ahlibank": ["Ahlibank"],
-    "alBaraka": ["alBaraka"],
-    "AlexBank": ["AlexBank"],
-    "ALMASHREQBank": ["ALMASHREQBank"],
-    "ArabAfricanBank": ["ArabAfricanBank"],
-    "ArabBank": ["ArabBank"],
-    "ArabTunisianBank": ["ArabTunisianBank"],
-    "AraratBank": ["AraratBank"],
-    "BANK": ["BANK"],
-    "BankAlEtihad": ["BankAlEtihad"],
-    "BankTransferMena": ["BankTransferMena"],
-    "BanqueduCaire": ["BanqueduCaire"],
-    "BanqueMisr": ["BanqueMisr"],
-    "Cashapp": ["Cashapp"],
-    "CIB": ["CIB"],
-    "CIBBank": ["CIBBank"],
-    "CreditAgricole": ["CreditAgricole"],
-    "EasyPay": ["EasyPay"],
-    "EmiratesNBD": ["EmiratesNBD"],
-    "EtisalatCash": ["EtisalatCash"],
-    "FirstIraqiBank": ["FirstIraqiBank"],
-    "FPS": ["FPS"],
-    "HSBCBankEgypt": ["HSBCBankEgypt"],
-    "InstaPay": ["InstaPay"],
-    "KFH": ["KFH"],
-    "klivvr": ["klivvr"],
-    "NBE": ["NBE"],
-    "NBK": ["NBK"],
-    "OrangeCash": ["OrangeCash"],
-    "OrangeMoney": ["OrangeMoney"],
-    "qaheracash": ["qaheracash"],
-    "QatarNationalBank": ["QatarNationalBank"],
-    "QNB": ["QNB"],
-    "SpecificBank": ["SpecificBank"],
-    "SWIFT": ["SWIFT"],
-    "telda": ["telda"],
-    "Vodafonecash": ["Vodafonecash"],
-    "wepay": ["wepay"],
-    "WesternUnion": ["WesternUnion"],
-    "ZAINCASH": ["ZAINCASH"]
+    "Ahlibank": ["Ahlibank"], "alBaraka": ["alBaraka"], "AlexBank": ["AlexBank"],
+    "ALMASHREQBank": ["ALMASHREQBank"], "ArabAfricanBank": ["ArabAfricanBank"],
+    "ArabBank": ["ArabBank"], "ArabTunisianBank": ["ArabTunisianBank"],
+    "AraratBank": ["AraratBank"], "BANK": ["BANK"], "BankAlEtihad": ["BankAlEtihad"],
+    "BankTransferMena": ["BankTransferMena"], "BanqueduCaire": ["BanqueduCaire"],
+    "BanqueMisr": ["BanqueMisr"], "Cashapp": ["Cashapp"], "CIB": ["CIB"],
+    "CIBBank": ["CIBBank"], "CreditAgricole": ["CreditAgricole"], "EasyPay": ["EasyPay"],
+    "EmiratesNBD": ["EmiratesNBD"], "EtisalatCash": ["EtisalatCash"], "FirstIraqiBank": ["FirstIraqiBank"],
+    "FPS": ["FPS"], "HSBCBankEgypt": ["HSBCBankEgypt"], "InstaPay": ["InstaPay"], "KFH": ["KFH"],
+    "klivvr": ["klivvr"], "NBE": ["NBE"], "NBK": ["NBK"], "OrangeCash": ["OrangeCash"],
+    "OrangeMoney": ["OrangeMoney"], "qaheracash": ["qaheracash"], "QatarNationalBank": ["QatarNationalBank"],
+    "QNB": ["QNB"], "SpecificBank": ["SpecificBank"], "SWIFT": ["SWIFT"], "telda": ["telda"],
+    "Vodafonecash": ["Vodafonecash"], "wepay": ["wepay"], "WesternUnion": ["WesternUnion"], "ZAINCASH": ["ZAINCASH"]
 }
 
 def process_pair(currency, method, threshold):
     variants = paytype_variants_map.get(method, [method])
     for variant in variants:
-        buy_ad = find_first_ad(currency, variant, "BUY", threshold)
-        sell_ad = find_first_ad(currency, variant, "SELL", threshold)
-        if not buy_ad or not sell_ad:
-            logging.debug(f"{currency} {variant}: missing side. buy_found={bool(buy_ad)} sell_found={bool(sell_ad)}. Continue variants.")
+        buyer_ad = find_first_ad(currency, variant, "BUY", threshold)
+        seller_ad = find_first_ad(currency, variant, "SELL", threshold)
+
+        if not buyer_ad or not seller_ad:
+            logging.debug(f"{currency} {variant}: missing side. buyer_found={bool(buyer_ad)} seller_found={bool(seller_ad)}")
             continue
 
         try:
-            # buy_ad = advert where counterparty BUYS USDT (you can SELL to them at buy_ad['price'])
-            # sell_ad = advert where counterparty SELLS USDT (you can BUY from them at sell_ad['price'])
-            price_buy = float(buy_ad["price"])
-            price_sell = float(sell_ad["price"])
-            spread_percent = ((price_buy / price_sell) - 1) * 100
+            buyer_price = float(buyer_ad["price"])
+            seller_price = float(seller_ad["price"])
+            spread_percent = ((buyer_price / seller_price) - 1.0) * 100.0
         except Exception as e:
-            logging.warning(f"Spread error {currency} {variant}: {e}")
+            logging.warning(f"Spread calc error {currency} {variant}: {e}")
             continue
 
         pay_friendly = friendly_pay_names.get(variant, variant)
-        logging.info(f"{currency} {variant}: buy_ad_price={price_buy:.4f} sell_ad_price={price_sell:.4f} spread={spread_percent:.2f}% threshold={threshold} min_buy={buy_ad['min_limit']:.2f} min_sell={sell_ad['min_limit']:.2f}")
+        logging.info(f"{currency}|{variant} buyer_price={buyer_price:.4f} seller_price={seller_price:.4f} spread={spread_percent:.2f}% thr={threshold} min_buyer={buyer_ad['min_limit']:.2f} min_seller={seller_ad['min_limit']:.2f}")
 
         pair_key = f"{currency}|{variant}"
         state = get_active_state(pair_key)
         was_active = state["active"]
 
-        if spread_percent >= Profit_Threshold_percent:
+        # If spread meets threshold -> either start or update
+        if spread_percent >= PROFIT_THRESHOLD_PERCENT:
+            # start
             if not was_active:
-                message = build_alert_message(currency, pay_friendly, sell_ad, buy_ad, spread_percent)
-                send_telegram_alert(message)
-                logging.info(f"Start alert sent for {pair_key} (spread {spread_percent:.2f}%)")
-                set_active_state_snapshot(pair_key, active=True, last_spread=spread_percent,
-                                          last_buy_price=sell_ad["price"], last_sell_price=buy_ad["price"], mark_sent=True)
-            else:
-                if should_send_update(state, spread_percent, sell_ad["price"], buy_ad["price"]):
-                    update_msg = build_update_message(currency, pay_friendly, sell_ad, buy_ad, spread_percent)
-                    send_telegram_alert(update_msg)
-                    logging.info(f"Update alert sent for {pair_key} (spread {spread_percent:.2f}%)")
-                    set_active_state_snapshot(pair_key, active=True, last_spread=spread_percent,
-                                              last_buy_price=sell_ad["price"], last_sell_price=buy_ad["price"], mark_sent=True)
+                # dedupe by TTL
+                if can_send_start(state):
+                    msg = build_alert_message(currency, pay_friendly, seller_ad, buyer_ad, spread_percent)
+                    sent = send_telegram_alert(msg)
+                    if sent:
+                        logging.info(f"Start alert sent for {pair_key} (spread {spread_percent:.2f}%)")
+                        set_active_state_snapshot(pair_key, active=True, last_spread=spread_percent,
+                                                  last_buy_price=seller_ad["price"], last_sell_price=buyer_ad["price"], mark_sent=True)
+                    else:
+                        logging.warning(f"Failed to send start alert for {pair_key}")
                 else:
+                    logging.debug(f"Start alert suppressed by TTL for {pair_key}")
                     set_active_state_snapshot(pair_key, active=True, last_spread=spread_percent,
-                                              last_buy_price=sell_ad["price"], last_sell_price=buy_ad["price"], mark_sent=False)
-        else:
-            if was_active:
-                end_msg = build_end_message(currency, pay_friendly, sell_ad, buy_ad, spread_percent)
-                send_telegram_alert(end_msg)
-                logging.info(f"End alert sent for {pair_key} (spread {spread_percent:.2f}%)")
-                set_active_state_snapshot(pair_key, active=False, last_spread=spread_percent,
-                                          last_buy_price=sell_ad["price"], last_sell_price=buy_ad["price"], mark_sent=False)
+                                              last_buy_price=seller_ad["price"], last_sell_price=buyer_ad["price"], mark_sent=False)
             else:
+                # already active -> maybe send update
+                if should_send_update(state, spread_percent, seller_ad["price"], buyer_ad["price"]):
+                    msg = build_update_message(currency, pay_friendly, seller_ad, buyer_ad, spread_percent)
+                    sent = send_telegram_alert(msg)
+                    if sent:
+                        logging.info(f"Update alert sent for {pair_key} (spread {spread_percent:.2f}%)")
+                        set_active_state_snapshot(pair_key, active=True, last_spread=spread_percent,
+                                                  last_buy_price=seller_ad["price"], last_sell_price=buyer_ad["price"], mark_sent=True)
+                    else:
+                        logging.warning(f"Failed to send update for {pair_key}")
+                else:
+                    # no update -> just refresh last observed values (don't mark as sent)
+                    set_active_state_snapshot(pair_key, active=True, last_spread=spread_percent,
+                                              last_buy_price=seller_ad["price"], last_sell_price=buyer_ad["price"], mark_sent=False)
+        else:
+            # spread below threshold
+            if was_active:
+                # send Ended message (once)
+                end_msg = build_end_message(currency, pay_friendly, seller_ad, buyer_ad, spread_percent)
+                sent = send_telegram_alert(end_msg)
+                if sent:
+                    logging.info(f"End alert sent for {pair_key} (spread {spread_percent:.2f}%)")
+                    set_active_state_snapshot(pair_key, active=False, last_spread=spread_percent,
+                                              last_buy_price=seller_ad["price"], last_sell_price=buyer_ad["price"], mark_sent=True)
+                else:
+                    logging.warning(f"Failed to send end alert for {pair_key}")
+            else:
+                # ensure state reflects latest observation
                 set_active_state_snapshot(pair_key, active=False, last_spread=spread_percent,
-                                          last_buy_price=sell_ad["price"], last_sell_price=buy_ad["price"], mark_sent=False)
+                                          last_buy_price=seller_ad["price"], last_sell_price=buyer_ad["price"], mark_sent=False)
 
-        # we've processed a valid advert-pair for this variant; stop trying other variants
+        # processed a valid buyer/seller pair for this variant -> don't try other variants
         break
 
 # ---------------------- main loop ----------------------
 def run_monitor_loop():
-    logging.info(f"Monitoring: {pairs_to_monitor}. Every {REFRESH_EVERY}s")
-    logging.info(f"Threshold: {Profit_Threshold_percent}%. Update-any={ALERT_UPDATE_ON_ANY_CHANGE}, "
-                 f"min-delta={ALERT_UPDATE_MIN_DELTA_PERCENT}%, price-delta={ALERT_UPDATE_PRICE_CHANGE_PERCENT}%")
+    logging.info(f"Monitoring {len(pairs_to_monitor)} pairs. Every {REFRESH_EVERY}s. Profit threshold={PROFIT_THRESHOLD_PERCENT}%")
     try:
         while True:
             start_ts = time.time()
-            with ThreadPoolExecutor(max_workers=min(len(pairs_to_monitor), 6)) as ex:
-                futures = [ex.submit(process_pair, cur, m, thr) for cur,m,thr in pairs_to_monitor]
+            with ThreadPoolExecutor(max_workers=min(len(pairs_to_monitor), 8)) as ex:
+                futures = [ex.submit(process_pair, cur, m, thr) for cur, m, thr in pairs_to_monitor]
                 for f in futures:
                     try:
                         f.result()
@@ -560,11 +595,12 @@ def run_monitor_loop():
                         logging.error(f"Proc error: {e}")
                     time.sleep(SLEEP_BETWEEN_PAIRS)
             elapsed = time.time() - start_ts
-            time.sleep(max(0, REFRESH_EVERY - elapsed))
-    except Exception:
-        logging.exception("run_monitor_loop crashed")
+            sleep_for = max(0, REFRESH_EVERY - elapsed)
+            time.sleep(sleep_for)
     except KeyboardInterrupt:
         logging.info("Stopped by user.")
+    except Exception:
+        logging.exception("run_monitor_loop crashed")
 
 def start_worker():
     run_monitor_loop()
