@@ -4,19 +4,30 @@
 import os
 import time
 import logging
+import random
 import requests
 import threading
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ---------------------- config (env-friendly) ----------------------
 BINANCE_P2P_URL = "https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search"
 ROWS_PER_REQUEST = int(os.getenv("ROWS_PER_REQUEST", "20"))
 TIMEOUT = int(os.getenv("TIMEOUT", "10"))
 MAX_SCAN_PAGES = int(os.getenv("MAX_SCAN_PAGES", "60"))
+
+# delays that control request pacing and staggering
 SLEEP_BETWEEN_PAGES = float(os.getenv("SLEEP_BETWEEN_PAGES", "0.09"))
-SLEEP_BETWEEN_PAIRS = float(os.getenv("SLEEP_BETWEEN_PAIRS", "0.05"))
+SLEEP_BETWEEN_PAIRS = float(os.getenv("SLEEP_BETWEEN_PAIRS", "0.05"))  # used to stagger task submission
+
+# rate-limiter / backoff tuning
+REQUESTS_PER_MINUTE = int(os.getenv("REQUESTS_PER_MINUTE", "60"))  # target requests per minute (global)
+MAX_CONCURRENT_WORKERS = int(os.getenv("MAX_CONCURRENT_WORKERS", "4"))  # threadpool size
+MAX_FETCH_RETRIES_ON_429 = int(os.getenv("MAX_FETCH_RETRIES_ON_429", "5"))
+INITIAL_BACKOFF_SECONDS = float(os.getenv("INITIAL_BACKOFF_SECONDS", "1.0"))
+MAX_BACKOFF_SECONDS = float(os.getenv("MAX_BACKOFF_SECONDS", "30.0"))
+JITTER_FACTOR = float(os.getenv("JITTER_FACTOR", "0.25"))  # fraction of backoff to randomize
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -153,24 +164,113 @@ if not pairs_to_monitor:
 
 # ---------------------- HTTP session ----------------------
 session = requests.Session()
-retries = Retry(total=3, backoff_factor=0.3, status_forcelist=[429, 500, 502, 503, 504])
+# keep original retry for non-429 transient server errors too
+retries = Retry(total=3, backoff_factor=0.3, status_forcelist=[500, 502, 503, 504])
 session.mount("https://", HTTPAdapter(max_retries=retries))
 HEADERS = {"Content-Type": "application/json", "User-Agent": "Mozilla/5.0 (compatible; ArbitrageChecker/1.0)"}
 
-# ---------------------- fetch (FIRST matching ad logic) ----------------------
+# ---------------------- global rate-limiter state ----------------------
+last_request_ts = [0.0]  # list to allow mutation under lock
+last_request_lock = threading.Lock()
+consecutive_429_count = 0
+consecutive_429_lock = threading.Lock()
+
+MIN_INTERVAL_BASE = max(0.0, 60.0 / max(1, REQUESTS_PER_MINUTE))
+
+def rate_limit_wait():
+    """
+    Ensure a minimum interval between *any* requests to Binance.
+    The interval is adjusted dynamically based on recent 429s (multiplier).
+    """
+    # read consecutive_429_count safely
+    with consecutive_429_lock:
+        c429 = consecutive_429_count
+
+    # if multiple consecutive 429s, exponentially increase spacing (multiplier)
+    if c429 <= 2:
+        multiplier = 1.0
+    else:
+        multiplier = 2 ** (c429 - 2)  # mild exponential backoff multiplier
+
+    effective_min_interval = MIN_INTERVAL_BASE * multiplier
+    with last_request_lock:
+        now = time.time()
+        elapsed = now - last_request_ts[0]
+        if elapsed < effective_min_interval:
+            to_sleep = effective_min_interval - elapsed
+            logging.debug(f"Rate limiter: sleeping {to_sleep:.3f}s to respect min interval (mult={multiplier})")
+            time.sleep(to_sleep)
+        last_request_ts[0] = time.time()
+
+# ---------------------- fetch (FIRST matching ad logic) with smart backoff ----------------------
 def fetch_page_raw(fiat, pay_type, trade_type, page, rows=ROWS_PER_REQUEST):
+    """
+    Robust fetch with:
+      - global rate limiting (rate_limit_wait)
+      - retries on network errors
+      - special handling for 429 with exponential backoff + jitter + Retry-After
+    Returns list of items (or empty list on failure).
+    """
     payload = {"asset": "USDT", "fiat": fiat, "tradeType": trade_type, "payTypes": [pay_type], "page": page, "rows": rows}
-    try:
-        r = session.post(BINANCE_P2P_URL, json=payload, headers=HEADERS, timeout=TIMEOUT)
-        r.raise_for_status()
-        return r.json().get("data") or []
-    except Exception as e:
-        logging.debug(f"Network error {fiat} {pay_type} {trade_type} p{page}: {e}")
-        return []
+
+    for attempt in range(1, MAX_FETCH_RETRIES_ON_429 + 1):
+        rate_limit_wait()
+        try:
+            r = session.post(BINANCE_P2P_URL, json=payload, headers=HEADERS, timeout=TIMEOUT)
+            # handle explicit 429
+            if r.status_code == 429:
+                # increment consecutive 429
+                with consecutive_429_lock:
+                    global consecutive_429_count
+                    consecutive_429_count += 1
+                    c429_local = consecutive_429_count
+                # read Retry-After if present
+                ra = None
+                try:
+                    ra_hdr = r.headers.get("Retry-After")
+                    if ra_hdr:
+                        ra = float(ra_hdr)
+                except Exception:
+                    ra = None
+                # compute backoff (exponential) + jitter
+                backoff = min(MAX_BACKOFF_SECONDS, INITIAL_BACKOFF_SECONDS * (2 ** (attempt - 1)))
+                jitter = random.uniform(0, JITTER_FACTOR * backoff)
+                wait = backoff + jitter
+                if ra and ra > wait:
+                    wait = ra + random.uniform(0, 1.0)  # prefer server suggestion
+                logging.warning(f"Received 429 for {fiat}/{pay_type}/{trade_type} p{page} (attempt {attempt}/{MAX_FETCH_RETRIES_ON_429}). Sleeping {wait:.2f}s (consec429={c429_local})")
+                time.sleep(wait)
+                continue
+
+            # non-429: try to raise for other HTTP errors
+            r.raise_for_status()
+            # success -> reset consecutive_429_count
+            with consecutive_429_lock:
+                consecutive_429_count = 0
+            try:
+                j = r.json()
+                return j.get("data") or []
+            except Exception:
+                logging.debug(f"Failed to parse JSON response for {fiat}/{pay_type}/{trade_type} p{page}")
+                return []
+        except requests.RequestException as e:
+            # network or other error; backoff and retry if attempts left
+            logging.debug(f"Network error {fiat} {pay_type} {trade_type} p{page} attempt {attempt}: {e}")
+            if attempt < MAX_FETCH_RETRIES_ON_429:
+                backoff = min(MAX_BACKOFF_SECONDS, INITIAL_BACKOFF_SECONDS * (2 ** (attempt - 1)))
+                jitter = random.uniform(0, JITTER_FACTOR * backoff)
+                wait = backoff + jitter
+                logging.debug(f"Retrying after {wait:.2f}s...")
+                time.sleep(wait)
+                continue
+            else:
+                return []
+    return []
 
 def find_first_ad(fiat, pay_type, trade_type, page_limit_threshold, rows=ROWS_PER_REQUEST):
     """
     Return the FIRST advert (in page order) whose minSingleTransAmount <= threshold.
+    (This keeps previous behavior: we accept adverts whose min <= threshold.)
     """
     for page in range(1, MAX_SCAN_PAGES + 1):
         items = fetch_page_raw(fiat, pay_type, trade_type, page, rows=rows)
@@ -289,8 +389,6 @@ ZOOZ_LINK = 'https://zoozfx.com'
 ZOOZ_HTML = f'©️<a href="{ZOOZ_LINK}">ZoozFX</a>'
 
 def build_alert_message(cur, pay_friendly, seller_ad, buyer_ad, spread_percent):
-    # seller_ad = from SELL page (we BUY from them) -> appears as Buy (from seller)
-    # buyer_ad = from BUY page (we SELL to them) -> appears as Sell (to buyer)
     flag = format_currency_flag(cur)
     abs_diff = abs(buyer_ad["price"] - seller_ad["price"])
     sign = "+" if spread_percent > 0 else ""
@@ -442,11 +540,9 @@ def process_pair(currency, method, threshold):
         pair_key = f"{currency}|{variant}"
         lock = get_pair_lock(pair_key)
         with lock:
-            # per your requirements: first search BUY page, then SELL page (first matching ad each)
             buyer_ad = find_first_ad(currency, variant, "BUY", threshold)
             seller_ad = find_first_ad(currency, variant, "SELL", threshold)
 
-            # debug: show what was found (helps if no messages are sent)
             logging.debug(f"[found] {pair_key} buyer_ad={buyer_ad} seller_ad={seller_ad}")
 
             if not buyer_ad or not seller_ad:
@@ -454,8 +550,6 @@ def process_pair(currency, method, threshold):
                 continue
 
             try:
-                # buyer_ad.price comes from BUY page => this is price you CAN SELL at (we call it sell_price)
-                # seller_ad.price comes from SELL page => this is price you CAN BUY at (we call it buy_price)
                 sell_price = float(buyer_ad["price"])
                 buy_price = float(seller_ad["price"])
                 spread_percent = ((sell_price / buy_price) - 1.0) * 100.0
@@ -469,9 +563,7 @@ def process_pair(currency, method, threshold):
             state = get_active_state(pair_key)
             was_active = state["active"]
 
-            # decide start / update / end (send only one message per cycle)
             if spread_percent >= PROFIT_THRESHOLD_PERCENT:
-                # Start
                 if not was_active:
                     if can_send_start(state):
                         msg = build_alert_message(currency, pay_friendly, seller_ad, buyer_ad, spread_percent)
@@ -487,7 +579,6 @@ def process_pair(currency, method, threshold):
                         set_active_state_snapshot(pair_key, active=True, last_spread=spread_percent,
                                                   last_buy_price=buy_price, last_sell_price=sell_price, mark_sent=False)
                 else:
-                    # Update?
                     if should_send_update(state, spread_percent, buy_price, sell_price):
                         msg = build_update_message(currency, pay_friendly, seller_ad, buyer_ad, spread_percent)
                         sent = send_telegram_alert(msg)
@@ -498,11 +589,9 @@ def process_pair(currency, method, threshold):
                         else:
                             logging.warning(f"Failed to send update for {pair_key}")
                     else:
-                        # no update; refresh last observed values
                         set_active_state_snapshot(pair_key, active=True, last_spread=spread_percent,
                                                   last_buy_price=buy_price, last_sell_price=sell_price, mark_sent=False)
             else:
-                # End
                 if was_active:
                     msg = build_end_message(currency, pay_friendly, seller_ad, buyer_ad, spread_percent)
                     sent = send_telegram_alert(msg)
@@ -516,30 +605,38 @@ def process_pair(currency, method, threshold):
                     set_active_state_snapshot(pair_key, active=False, last_spread=spread_percent,
                                               last_buy_price=buy_price, last_sell_price=sell_price, mark_sent=False)
 
-        # processed one variant -> stop trying other variants
-        break
+        break  # stop trying other variants after first processed
 
 # ---------------------- main loop ----------------------
 def run_monitor_loop():
-    logging.info(f"Monitoring {len(pairs_to_monitor)} pairs. Every {REFRESH_EVERY}s. Profit threshold={PROFIT_THRESHOLD_PERCENT}%")
+    logging.info(f"Monitoring {len(pairs_to_monitor)} pairs. Every {REFRESH_EVERY}s. Profit threshold={PROFIT_THRESHOLD_PERCENT}%. Workers={MAX_CONCURRENT_WORKERS} RPM={REQUESTS_PER_MINUTE}")
     try:
         while True:
             start_ts = time.time()
-            for cur, m, thr in pairs_to_monitor:
-                try:
-                    process_pair(cur, m, thr)
-                except Exception as e:
-                    logging.error(f"Proc error: {e}")
-                # Delay صغير بعد كل زوج
-                time.sleep(SLEEP_BETWEEN_PAIRS)
+
+            # submit tasks with staggering to avoid burst creation
+            futures = []
+            with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_WORKERS) as ex:
+                for cur, m, thr in pairs_to_monitor:
+                    futures.append(ex.submit(process_pair, cur, m, thr))
+                    # stagger task start to avoid simultaneous bursts
+                    time.sleep(SLEEP_BETWEEN_PAIRS)
+
+                # wait for completion and surface exceptions
+                for f in as_completed(futures):
+                    try:
+                        f.result()
+                    except Exception as e:
+                        logging.error(f"Proc error: {e}")
 
             elapsed = time.time() - start_ts
-            time.sleep(max(0, REFRESH_EVERY - elapsed))
+            sleep_for = max(0, REFRESH_EVERY - elapsed)
+            logging.debug(f"Cycle done in {elapsed:.2f}s, sleeping {sleep_for:.2f}s until next cycle")
+            time.sleep(sleep_for)
     except KeyboardInterrupt:
         logging.info("Stopped by user.")
     except Exception:
         logging.exception("run_monitor_loop crashed")
-
 
 def start_worker():
     run_monitor_loop()
