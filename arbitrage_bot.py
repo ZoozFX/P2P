@@ -71,14 +71,10 @@ currency_list = ["USD", "CAD", "NZD", "AUD", "GBP", "JPY", "EUR", "EGP", "MAD", 
 
 payment_methods_map = {
     "EGP": [
-        "Ahlibank", "alBaraka", "AlexBank", "ALMASHREQBank", "ArabAfricanBank",
-        "ArabBank", "ArabTunisianBank", "AraratBank", "BANK", "BankAlEtihad",
-        "BankTransferMena", "BanqueduCaire", "BanqueMisr", "Cashapp", "CIB",
-        "CIBBank", "CreditAgricole", "EasyPay", "EmiratesNBD", "EtisalatCash",
-        "FirstIraqiBank", "FPS", "HSBCBankEgypt", "InstaPay", "KFH", "klivvr",
-        "NBE", "NBK", "OrangeCash", "OrangeMoney", "qaheracash", "QatarNationalBank",
-        "QNB", "SpecificBank", "SWIFT", "telda", "Vodafonecash", "wepay",
-        "WesternUnion", "ZAINCASH"
+        "AlexBank", "ALMASHREQBank", "ArabAfricanBank","BANK",
+        "BanqueMisr", "CIB","CIBBank", "EtisalatCash",
+        "InstaPay", "klivvr","OrangeCash", "OrangeMoney",
+        "telda", "Vodafonecash", "wepay"
     ],
     "USD": ["SkrillMoneybookers", "NETELLER", "AirTM", "DukascopyBank"],
     "CAD": ["SkrillMoneybookers", "NETELLER", "AirTM", "DukascopyBank"],
@@ -471,7 +467,7 @@ def build_alert_message(cur, pay_friendly, seller_ad, buyer_ad, spread_percent):
     abs_diff = abs(buyer_ad["price"] - seller_ad["price"])
     sign = "+" if spread_percent > 0 else ""
     return (
-        f"🚨 Alert {flag} — {cur} ({pay_friendly})\n\n"
+        f"🚨 Alert {flag} — #{cur} ({pay_friendly})\n\n"
         f"🔴 Sell: <code>{buyer_ad['price']:.4f} {cur}</code>\n"
         f"🟢 Buy: <code>{seller_ad['price']:.4f} {cur}</code>\n\n"
         f"💰 Spread: {sign}{spread_percent:.2f}%  (<code>{abs_diff:.4f} {cur}</code>)\n\n"
@@ -484,7 +480,7 @@ def build_update_message(cur, pay_friendly, seller_ad, buyer_ad, spread_percent)
     abs_diff = abs(buyer_ad["price"] - seller_ad["price"])
     sign = "+" if spread_percent > 0 else ""
     return (
-        f"🔁 Update {flag} — {cur} ({pay_friendly})\n\n"
+        f"🔁 Update {flag} — #{cur} ({pay_friendly})\n\n"
         f"🔴 Sell: <code>{buyer_ad['price']:.4f} {cur}</code>\n"
         f"🟢 Buy: <code>{seller_ad['price']:.4f} {cur}</code>\n\n"
         f"💰 Spread: {sign}{spread_percent:.2f}%  (<code>{abs_diff:.4f} {cur}</code>)\n\n"
@@ -497,7 +493,7 @@ def build_end_message(cur, pay_friendly, seller_ad, buyer_ad, spread_percent):
     abs_diff = abs(buyer_ad["price"] - seller_ad["price"])
     sign = "+" if spread_percent > 0 else ""
     return (
-        f"❌ Ended {flag} — {cur} ({pay_friendly})\n\n"
+        f"❌ Ended {flag} — #{cur} ({pay_friendly})\n\n"
         f"🔴 Sell: <code>{buyer_ad['price']:.4f} {cur}</code>\n"
         f"🟢 Buy: <code>{seller_ad['price']:.4f} {cur}</code>\n\n"
         f"💰 Spread: {sign}{spread_percent:.2f}%  (<code>{abs_diff:.4f} {cur}</code>)\n\n"
