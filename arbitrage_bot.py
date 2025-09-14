@@ -516,7 +516,7 @@ def _make_hashtag(cur, method):
         token = token[:30].rstrip('_')
     if not cur_token or not token:
         return ""
-    return f"<code>#{cur_token}_{token}</code>"
+    return f"#{cur_token}_{token}"
 
 
 def build_alert_message(cur, pay_friendly, seller_ad, buyer_ad, spread_percent):
@@ -533,7 +533,7 @@ def build_alert_message(cur, pay_friendly, seller_ad, buyer_ad, spread_percent):
         f"🟢 Buy: <code>{seller_ad['price']:.4f} {cur}</code>\n\n"
         f"💰 Spread: {sign}{spread_percent:.2f}%  (<code>{abs_diff:.4f} {cur}</code>)\n\n"
         f"💥 Good Luck! {ZOOZ_HTML}\n\n"
-        f"=========== {hashtag_line} ==========="
+        f"★★★ {hashtag_line} ★★★"
     )
 
 
@@ -550,7 +550,7 @@ def build_update_message(cur, pay_friendly, seller_ad, buyer_ad, spread_percent)
         f"🟢 Buy: <code>{seller_ad['price']:.4f} {cur}</code>\n\n"
         f"💰 Spread: {sign}{spread_percent:.2f}%  (<code>{abs_diff:.4f} {cur}</code>)\n\n"
         f"💥 Good Luck! {ZOOZ_HTML}\n\n"
-        f"=========== {hashtag_line} ==========="
+        f"★★★ {hashtag_line} ★★★"
     )
 
 
@@ -567,7 +567,7 @@ def build_end_message(cur, pay_friendly, seller_ad, buyer_ad, spread_percent):
         f"🟢 Buy: <code>{seller_ad['price']:.4f} {cur}</code>\n\n"
         f"💰 Spread: {sign}{spread_percent:.2f}%  (<code>{abs_diff:.4f} {cur}</code>)\n\n"
         f"💥 Good Luck! {ZOOZ_HTML}\n\n"
-        f"=========== {hashtag_line} ==========="
+        f"★★★ {hashtag_line} ★★★"
     )
 
 # ---------------------- state & locks ----------------------
