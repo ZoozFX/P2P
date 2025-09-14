@@ -7,7 +7,12 @@ Improved / fixed ZoozFX P2P monitor
  - Stores last_message_type and last_sent_signature in state so we never re-send a "Start" while the pair is still active
  - Keeps original behaviour otherwise; minimal invasive changes
 
-Drop-in replacement for your original script. Keep your existing env names.
+Additional features added:
+ - Startup cleanup: before the first alert, attempt to delete previous messages (via getUpdates) except the
+   first photo message found from the user; use that photo's file_id to populate TELEGRAM_IMAGE_FILE_ID.
+ - Add hashtag at end of every telegram message: #<CURRENCY>_<PAYMETHOD> (sanitized)
+ - Per-pair profit threshold via PROFIT_THRESHOLDS env var
+ - Global filter for enabled payment methods via ENABLED_PAY_METHODS env var
 """
 
 import os
@@ -17,6 +22,7 @@ import random
 import math
 import requests
 import threading
+import re
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -65,6 +71,10 @@ MIN_LIMIT_THRESHOLDS_ENV = os.getenv("MIN_LIMIT_THRESHOLDS", "").strip()
 PAIRS_ENV = os.getenv("PAIRS", "").strip()
 SELECTED_CURRENCY = os.getenv("SELECTED_CURRENCY", "ALL").strip().upper()
 SELECTED_METHOD = os.getenv("SELECTED_METHOD", "ALL").strip()
+
+# New envs:
+PROFIT_THRESHOLDS_ENV = os.getenv("PROFIT_THRESHOLDS", "").strip()  # e.g. "GBP:Skrill=2;MAD=5;USD=ALL=3"
+ENABLED_PAY_METHODS_ENV = os.getenv("ENABLED_PAY_METHODS", "").strip()  # e.g. "Skrill,NETELLER"
 
 # ---------------------- static lists ----------------------
 currency_list = ["USD", "CAD", "NZD", "AUD", "GBP", "JPY", "EUR", "EGP", "MAD", "SAR", "AED", "KWD", "DZD"]
@@ -148,8 +158,53 @@ def parse_pairs_env(env_str, thresholds, default_map):
     return pairs
 
 
-min_limit_thresholds = parse_thresholds(MIN_LIMIT_THRESHOLDS_ENV, currency_list)
+# ---------------------- profit thresholds parsing ----------------------
+def parse_profit_thresholds(env_str):
+    """
+    Parse strings like:
+      "GBP:Skrill=2;MAD=5;USD:ALL=3"
+    Returns dict with keys (CUR, METHOD_UPPER) where METHOD_UPPER may be 'ALL'.
+    """
+    out = {}
+    if not env_str:
+        return out
+    parts = [p.strip() for p in re.split(r"[,;]", env_str) if p.strip()]
+    for p in parts:
+        if "=" not in p:
+            continue
+        lhs, rhs = p.split("=", 1)
+        lhs = lhs.strip()
+        try:
+            val = float(rhs.strip())
+        except Exception:
+            logging.warning(f"Invalid profit threshold value: {rhs} in entry {p}")
+            continue
+        if ":" in lhs:
+            cur, method = lhs.split(":", 1)
+            cur = cur.strip().upper()
+            method = method.strip().upper()
+            out[(cur, method)] = val
+        else:
+            cur = lhs.strip().upper()
+            out[(cur, "ALL")] = val
+    return out
 
+
+def get_profit_threshold_for_pair(cur, method, profit_map):
+    # lookup order: (CUR,METHOD) -> (CUR,ALL) -> default global PROFIT_THRESHOLD_PERCENT
+    if not cur:
+        return PROFIT_THRESHOLD_PERCENT
+    key1 = (cur.upper(), method.upper())
+    if key1 in profit_map:
+        return profit_map[key1]
+    key2 = (cur.upper(), "ALL")
+    if key2 in profit_map:
+        return profit_map[key2]
+    return PROFIT_THRESHOLD_PERCENT
+
+
+# ---------------------- build pairs to monitor ----------------------
+min_limit_thresholds = parse_thresholds(MIN_LIMIT_THRESHOLDS_ENV, currency_list)
 pairs_to_monitor = []
 if PAIRS_ENV:
     pairs_to_monitor = parse_pairs_env(PAIRS_ENV, min_limit_thresholds, payment_methods_map)
@@ -166,16 +221,32 @@ else:
             logging.error(f"No methods for {cur}. Exiting.")
             raise SystemExit(1)
         if SELECTED_METHOD and SELECTED_METHOD.upper() != "ALL":
-            if SELECTED_METHOD not in methods:
+            sel_method = SELECTED_METHOD
+            # allow friendly match
+            if sel_method not in methods and all(friendly_pay_names.get(m, m) != sel_method for m in methods):
                 logging.error(f"Method {SELECTED_METHOD} not valid for {cur}. Exiting.")
                 raise SystemExit(1)
-            methods = [SELECTED_METHOD]
+            # filter for the actual method(s) matching SELECTED_METHOD
+            methods = [m for m in methods if m == sel_method or friendly_pay_names.get(m) == sel_method]
         for m in methods:
             pairs_to_monitor.append((cur, m, min_limit_thresholds.get(cur, float("inf"))))
+
+# Apply ENABLED_PAY_METHODS filter if provided
+ENABLED_PAY_METHODS = set([s.strip() for s in re.split(r"[,;]", ENABLED_PAY_METHODS_ENV) if s.strip()])
+if ENABLED_PAY_METHODS:
+    allowed_upper = {s.upper() for s in ENABLED_PAY_METHODS}
+    def method_allowed(m):
+        return (m.upper() in allowed_upper) or (friendly_pay_names.get(m, m).upper() in allowed_upper)
+    before = len(pairs_to_monitor)
+    pairs_to_monitor = [p for p in pairs_to_monitor if method_allowed(p[1])]
+    logging.info(f"ENABLED_PAY_METHODS filter applied: kept {len(pairs_to_monitor)}/{before} pairs")
 
 if not pairs_to_monitor:
     logging.error("No currency/payment pairs selected. Exiting.")
     raise SystemExit(1)
+
+# parse profit thresholds map
+profit_thresholds_map = parse_profit_thresholds(PROFIT_THRESHOLDS_ENV)
 
 # ---------------------- HTTP session ----------------------
 session = requests.Session()
@@ -390,8 +461,116 @@ def _try_send_photo(payload_data, files=None):
     except Exception as e:
         return False, str(e), None
 
+# startup cleanup flag and lock
+did_startup_cleanup = False
+startup_cleanup_lock = threading.Lock()
+
+def startup_cleanup_preserve_first_photo():
+    """
+    Attempt to fetch pending updates, find the first photo message from the target chat and preserve it,
+    delete other messages returned by getUpdates for that chat (best-effort). Also update TELEGRAM_IMAGE_FILE_ID
+    if not set.
+    This runs once (protected by startup_cleanup_lock) before the first alert send.
+    """
+    global did_startup_cleanup, TELEGRAM_IMAGE_FILE_ID
+    with startup_cleanup_lock:
+        if did_startup_cleanup:
+            return
+        if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+            logging.info("Telegram config missing; skipping startup cleanup")
+            did_startup_cleanup = True
+            return
+
+        try:
+            chat_id_int = int(TELEGRAM_CHAT_ID)
+        except Exception:
+            logging.warning("Invalid TELEGRAM_CHAT_ID; skipping startup cleanup")
+            did_startup_cleanup = True
+            return
+
+        updates = []
+        try:
+            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+            r = session.get(url, params={"limit": 100, "timeout": 0}, timeout=TIMEOUT)
+            r.raise_for_status()
+            data = r.json() or {}
+            updates = data.get("result", []) or []
+        except Exception as e:
+            logging.warning(f"startup cleanup getUpdates failed: {e}")
+            updates = []
+
+        if not updates:
+            logging.info("startup cleanup: no updates returned by getUpdates.")
+            did_startup_cleanup = True
+            return
+
+        # find earliest photo message in this chat
+        updates_sorted = sorted(updates, key=lambda u: u.get("update_id", 0))
+        preserved_message_id = None
+        preserved_file_id = None
+        for u in updates_sorted:
+            msg = u.get("message") or u.get("edited_message")
+            if not msg:
+                continue
+            chat = msg.get("chat", {})
+            if chat.get("id") != chat_id_int:
+                continue
+            # look for photo
+            if "photo" in msg and msg.get("photo"):
+                photos = msg.get("photo")
+                # keep largest
+                photo_obj = photos[-1]
+                preserved_file_id = photo_obj.get("file_id")
+                preserved_message_id = msg.get("message_id")
+                break
+
+        if preserved_message_id:
+            # update TELEGRAM_IMAGE_FILE_ID if empty
+            if not TELEGRAM_IMAGE_FILE_ID and preserved_file_id:
+                TELEGRAM_IMAGE_FILE_ID = preserved_file_id
+                logging.info(f"Discovered TELEGRAM_IMAGE_FILE_ID from preserved photo: {TELEGRAM_IMAGE_FILE_ID}")
+
+            # delete everything else (best-effort)
+            for u in updates_sorted:
+                msg = u.get("message") or u.get("edited_message")
+                if not msg:
+                    continue
+                chat = msg.get("chat", {})
+                if chat.get("id") != chat_id_int:
+                    continue
+                mid = msg.get("message_id")
+                if mid == preserved_message_id:
+                    continue
+                try:
+                    del_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteMessage"
+                    resp = session.post(del_url, json={"chat_id": chat_id_int, "message_id": mid}, timeout=TIMEOUT)
+                    if resp.ok:
+                        logging.info(f"Deleted message {mid} in chat {chat_id_int}")
+                    else:
+                        logging.debug(f"deleteMessage failed for {mid}: status={resp.status_code} resp={getattr(resp,'text',None)}")
+                except Exception as e:
+                    logging.debug(f"deleteMessage exception for {mid}: {e}")
+                time.sleep(0.05)
+
+            # clear updates offset so getUpdates won't return again
+            try:
+                last_update_id = updates_sorted[-1].get("update_id", 0)
+                session.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates", params={"offset": last_update_id + 1}, timeout=TIMEOUT)
+            except Exception:
+                pass
+        else:
+            logging.info("No photo message found to preserve during startup cleanup; nothing deleted.")
+        did_startup_cleanup = True
+
 
 def send_telegram_alert(message):
+    # run startup cleanup once before first send
+    try:
+        if not did_startup_cleanup:
+            startup_cleanup_preserve_first_photo()
+    except Exception as e:
+        logging.debug(f"startup cleanup error (ignored): {e}")
+
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         logging.info("Telegram token/chat not set; skipping send. Message preview:\n" + message)
         return False
@@ -461,43 +640,51 @@ def send_telegram_alert(message):
 ZOOZ_LINK = 'https://zoozfx.com'
 ZOOZ_HTML = f'©️<a href="{ZOOZ_LINK}">ZoozFX</a>'
 
+def build_hashtag(cur, pay_friendly):
+    # sanitize pay_friendly to alnum (remove spaces/punctuation), uppercase/lowercase kept as-is
+    token = re.sub(r'[^A-Za-z0-9]', '', str(pay_friendly))
+    return f"#{cur}_{token}" if token else f"#{cur}"
 
 def build_alert_message(cur, pay_friendly, seller_ad, buyer_ad, spread_percent):
     flag = format_currency_flag(cur)
     abs_diff = abs(buyer_ad["price"] - seller_ad["price"])
     sign = "+" if spread_percent > 0 else ""
+    hashtag = build_hashtag(cur, pay_friendly)
     return (
         f"🚨 Alert {flag} — #{cur} ({pay_friendly})\n\n"
         f"🔴 Sell: <code>{buyer_ad['price']:.4f} {cur}</code>\n"
         f"🟢 Buy: <code>{seller_ad['price']:.4f} {cur}</code>\n\n"
         f"💰 Spread: {sign}{spread_percent:.2f}%  (<code>{abs_diff:.4f} {cur}</code>)\n\n"
-        f"💥 Good Luck! {ZOOZ_HTML}"
+        f"💥 Good Luck! {ZOOZ_HTML}\n\n"
+        f"{hashtag}"
     )
-
 
 def build_update_message(cur, pay_friendly, seller_ad, buyer_ad, spread_percent):
     flag = format_currency_flag(cur)
     abs_diff = abs(buyer_ad["price"] - seller_ad["price"])
     sign = "+" if spread_percent > 0 else ""
+    hashtag = build_hashtag(cur, pay_friendly)
     return (
         f"🔁 Update {flag} — #{cur} ({pay_friendly})\n\n"
         f"🔴 Sell: <code>{buyer_ad['price']:.4f} {cur}</code>\n"
         f"🟢 Buy: <code>{seller_ad['price']:.4f} {cur}</code>\n\n"
         f"💰 Spread: {sign}{spread_percent:.2f}%  (<code>{abs_diff:.4f} {cur}</code>)\n\n"
-        f"💥 Good Luck! {ZOOZ_HTML}"
+        f"💥 Good Luck! {ZOOZ_HTML}\n\n"
+        f"{hashtag}"
     )
-
 
 def build_end_message(cur, pay_friendly, seller_ad, buyer_ad, spread_percent):
     flag = format_currency_flag(cur)
     abs_diff = abs(buyer_ad["price"] - seller_ad["price"])
     sign = "+" if spread_percent > 0 else ""
+    hashtag = build_hashtag(cur, pay_friendly)
     return (
         f"❌ Ended {flag} — #{cur} ({pay_friendly})\n\n"
         f"🔴 Sell: <code>{buyer_ad['price']:.4f} {cur}</code>\n"
         f"🟢 Buy: <code>{seller_ad['price']:.4f} {cur}</code>\n\n"
         f"💰 Spread: {sign}{spread_percent:.2f}%  (<code>{abs_diff:.4f} {cur}</code>)\n\n"
-        f"💥 Good Luck! {ZOOZ_HTML}"
+        f"💥 Good Luck! {ZOOZ_HTML}\n\n"
+        f"{hashtag}"
     )
 
 # ---------------------- state & locks ----------------------
@@ -751,7 +938,9 @@ def process_pair(currency, method, threshold):
                 continue
 
             pay_friendly = friendly_pay_names.get(variant, variant)
-            logging.info(f"{pair_key} sell_price(from BUY page)={sell_price:.4f} buy_price(from SELL page)={buy_price:.4f} spread={spread_percent:.2f}% thr={threshold} min_sell={buyer_ad['min_limit']:.2f} min_buy={seller_ad['min_limit']:.2f}")
+            # determine profit threshold for this pair (currency + method variant)
+            profit_thr = get_profit_threshold_for_pair(currency, pay_friendly, profit_thresholds_map)
+            logging.info(f"{pair_key} sell_price(from BUY page)={sell_price:.4f} buy_price(from SELL page)={buy_price:.4f} spread={spread_percent:.2f}% thr={profit_thr} min_sell={buyer_ad['min_limit']:.2f} min_buy={seller_ad['min_limit']:.2f}")
 
             state = get_active_state(pair_key)
             was_active = state["active"]
@@ -760,7 +949,7 @@ def process_pair(currency, method, threshold):
             current_sig = compute_signature(spread_percent, buy_price, sell_price)
 
             # decide start / update / end (send only one message per cycle)
-            if spread_percent >= PROFIT_THRESHOLD_PERCENT:
+            if spread_percent >= profit_thr:
                 # Opportunity exists
                 if not was_active:
                     # We are not currently active -> candidate for START
@@ -823,7 +1012,7 @@ def process_pair(currency, method, threshold):
 # ---------------------- main loop ----------------------
 
 def run_monitor_loop():
-    logging.info(f"Monitoring {len(pairs_to_monitor)} pairs. Every {REFRESH_EVERY}s. Profit threshold={PROFIT_THRESHOLD_PERCENT}%. Workers={MAX_CONCURRENT_WORKERS} RPM={REQUESTS_PER_MINUTE}")
+    logging.info(f"Monitoring {len(pairs_to_monitor)} pairs. Every {REFRESH_EVERY}s. Default Profit threshold={PROFIT_THRESHOLD_PERCENT}%. Workers={MAX_CONCURRENT_WORKERS} RPM={REQUESTS_PER_MINUTE}")
     try:
         while True:
             start_ts = time.time()
