@@ -526,14 +526,14 @@ def build_alert_message(cur, pay_friendly, seller_ad, buyer_ad, spread_percent):
     # determine method token (prefer seller_ad.payment_method or buyer_ad.payment_method)
     method_name = (seller_ad.get("payment_method") or buyer_ad.get("payment_method") or pay_friendly)
     hashtag = _make_hashtag(cur, method_name)
-    hashtag_line = (hashtag + "\n\n") if hashtag else ""
+    hashtag_line = (hashtag) if hashtag else ""
     return (
-        f"🚨 Alert {flag} — #{cur} ({pay_friendly})\n\n"
+        f"🚨 Alert {flag} — {cur} ({pay_friendly})\n\n"
         f"🔴 Sell: <code>{buyer_ad['price']:.4f} {cur}</code>\n"
         f"🟢 Buy: <code>{seller_ad['price']:.4f} {cur}</code>\n\n"
         f"💰 Spread: {sign}{spread_percent:.2f}%  (<code>{abs_diff:.4f} {cur}</code>)\n\n"
-        f"{hashtag_line}"
-        f"💥 Good Luck! {ZOOZ_HTML}"
+        f"💥 Good Luck! {ZOOZ_HTML}\n\n"
+        f"=========== {hashtag_line} ==========="
     )
 
 
@@ -543,14 +543,14 @@ def build_update_message(cur, pay_friendly, seller_ad, buyer_ad, spread_percent)
     sign = "+" if spread_percent > 0 else ""
     method_name = (seller_ad.get("payment_method") or buyer_ad.get("payment_method") or pay_friendly)
     hashtag = _make_hashtag(cur, method_name)
-    hashtag_line = (hashtag + "\n\n") if hashtag else ""
+    hashtag_line = (hashtag) if hashtag else ""
     return (
-        f"🔁 Update {flag} — #{cur} ({pay_friendly})\n\n"
+        f"🔁 Update {flag} — {cur} ({pay_friendly})\n\n"
         f"🔴 Sell: <code>{buyer_ad['price']:.4f} {cur}</code>\n"
         f"🟢 Buy: <code>{seller_ad['price']:.4f} {cur}</code>\n\n"
         f"💰 Spread: {sign}{spread_percent:.2f}%  (<code>{abs_diff:.4f} {cur}</code>)\n\n"
-        f"{hashtag_line}"
-        f"💥 Good Luck! {ZOOZ_HTML}"
+        f"💥 Good Luck! {ZOOZ_HTML}\n\n"
+        f"=========== {hashtag_line} ==========="
     )
 
 
@@ -560,14 +560,14 @@ def build_end_message(cur, pay_friendly, seller_ad, buyer_ad, spread_percent):
     sign = "+" if spread_percent > 0 else ""
     method_name = (seller_ad.get("payment_method") or buyer_ad.get("payment_method") or pay_friendly)
     hashtag = _make_hashtag(cur, method_name)
-    hashtag_line = (hashtag + "\n\n") if hashtag else ""
+    hashtag_line = (hashtag) if hashtag else ""
     return (
-        f"❌ Ended {flag} — #{cur} ({pay_friendly})\n\n"
+        f"❌ Ended {flag} — {cur} ({pay_friendly})\n\n"
         f"🔴 Sell: <code>{buyer_ad['price']:.4f} {cur}</code>\n"
         f"🟢 Buy: <code>{seller_ad['price']:.4f} {cur}</code>\n\n"
         f"💰 Spread: {sign}{spread_percent:.2f}%  (<code>{abs_diff:.4f} {cur}</code>)\n\n"
-        f"{hashtag_line}"
-        f"💥 Good Luck! {ZOOZ_HTML}"
+        f"💥 Good Luck! {ZOOZ_HTML}\n\n"
+        f"=========== {hashtag_line} ==========="
     )
 
 # ---------------------- state & locks ----------------------
