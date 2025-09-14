@@ -1,13 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Improved / fixed ZoozFX P2P monitor with added env controls:
- - PAYMENT_METHODS / EXCLUDE_PAYMENT_METHODS to whitelist/exclude payment methods globally
- - PROFIT_THRESHOLDS to specify profit % per currency and/or per currency:method and method-only, plus DEFAULT
- - Appends a professional hashtag (e.g., #GBP_Skrill) to every Telegram message
- - Minimal invasive changes otherwise
-"""
-
 import os
 import time
 import logging
