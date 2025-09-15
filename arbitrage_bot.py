@@ -528,11 +528,10 @@ def build_alert_message(cur, pay_friendly, seller_ad, buyer_ad, spread_percent):
     hashtag = _make_hashtag(cur, method_name)
     hashtag_line = (hashtag) if hashtag else ""
     return (
-        f"🚨 Alert {flag} — {cur} ({pay_friendly})\n\n"
+        f"🚨 Alert {flag} ★ {hashtag_line} ★\n\n"
         f"🔴 Sell: <code>{buyer_ad['price']:.4f} {cur}</code>\n"
         f"🟢 Buy: <code>{seller_ad['price']:.4f} {cur}</code>\n\n"
-        f"🔥 <b>Spread: {sign}{spread_percent:.2f}%  (<code>{abs_diff:.4f} {cur}</code>)</b> 🔥\n\n"
-        f"★★★ {hashtag_line} ★★★\n\n"
+        f"🔥 <b>Spread: {sign}{spread_percent:.2f}%  (<code>{abs_diff:.4f} {cur}</code>)</b>\n\n"
         f"➤ {ZOOZ_HTML} ⭐️"
     )
 
@@ -545,11 +544,10 @@ def build_update_message(cur, pay_friendly, seller_ad, buyer_ad, spread_percent)
     hashtag = _make_hashtag(cur, method_name)
     hashtag_line = (hashtag) if hashtag else ""
     return (
-        f"🔁 Update {flag} — {cur} ({pay_friendly})\n\n"
+        f"🔁 Update {flag} ★ {hashtag_line} ★\n\n"
         f"🔴 Sell: <code>{buyer_ad['price']:.4f} {cur}</code>\n"
         f"🟢 Buy: <code>{seller_ad['price']:.4f} {cur}</code>\n\n"
-        f"🔥 <b>Spread: {sign}{spread_percent:.2f}%  (<code>{abs_diff:.4f} {cur}</code>)</b> 🔥\n\n"
-        f"★★★ {hashtag_line} ★★★\n\n"
+        f"🔥 <b>Spread: {sign}{spread_percent:.2f}%  (<code>{abs_diff:.4f} {cur}</code>)</b>\n\n"
         f"➤ {ZOOZ_HTML} ⭐️"
     )
 
@@ -562,11 +560,10 @@ def build_end_message(cur, pay_friendly, seller_ad, buyer_ad, spread_percent):
     hashtag = _make_hashtag(cur, method_name)
     hashtag_line = (hashtag) if hashtag else ""
     return (
-        f"❌ Ended {flag} — {cur} ({pay_friendly})\n\n"
+        f"❌ Ended {flag} ★ {hashtag_line} ★\n\n"
         f"🔴 Sell: <code>{buyer_ad['price']:.4f} {cur}</code>\n"
         f"🟢 Buy: <code>{seller_ad['price']:.4f} {cur}</code>\n\n"
-        f"🔥 <b>Spread: {sign}{spread_percent:.2f}%  (<code>{abs_diff:.4f} {cur}</code>)</b> 🔥\n\n"
-        f"★★★ {hashtag_line} ★★★\n\n"
+        f"🔥 <b>Spread: {sign}{spread_percent:.2f}%  (<code>{abs_diff:.4f} {cur}</code>)</b>\n\n"
         f"➤ {ZOOZ_HTML} ⭐️"
     )
 
