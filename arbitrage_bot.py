@@ -49,8 +49,12 @@ ALERT_UPDATE_ON_ANY_CHANGE = os.getenv("ALERT_UPDATE_ON_ANY_CHANGE", "1").strip(
 ALERT_UPDATE_MIN_DELTA_PERCENT = float(os.getenv("ALERT_UPDATE_MIN_DELTA_PERCENT", "0.01"))
 ALERT_UPDATE_PRICE_CHANGE_PERCENT = float(os.getenv("ALERT_UPDATE_PRICE_CHANGE_PERCENT", "0.05"))
 
+# new envs: min & max defaults + per-currency thresholds
 DEFAULT_MIN_LIMIT = float(os.getenv("DEFAULT_MIN_LIMIT", "100"))
 MIN_LIMIT_THRESHOLDS_ENV = os.getenv("MIN_LIMIT_THRESHOLDS", "").strip()
+DEFAULT_MAX_LIMIT = float(os.getenv("DEFAULT_MAX_LIMIT", "0"))  # 0 == no max constraint by default
+MAX_LIMIT_THRESHOLDS_ENV = os.getenv("MAX_LIMIT_THRESHOLDS", "").strip()
+
 PAIRS_ENV = os.getenv("PAIRS", "").strip()
 SELECTED_CURRENCY = os.getenv("SELECTED_CURRENCY", "ALL").strip().upper()
 SELECTED_METHOD = os.getenv("SELECTED_METHOD", "ALL").strip()
@@ -106,8 +110,13 @@ def safe_float(val, default=0.0):
         return float(default)
 
 
-def parse_thresholds(env_str, defaults):
-    out = {k: float(DEFAULT_MIN_LIMIT) for k in defaults}
+def parse_thresholds(env_str, currencies, default_value):
+    """
+    Parse env string like "GBP=200;EUR=150" into dict { 'GBP':200.0, 'EUR':150.0 }.
+    `currencies` is iterable of currency keys to pre-populate defaults.
+    `default_value` is used to fill unspecified currencies.
+    """
+    out = {k: float(default_value) for k in currencies}
     if not env_str:
         return out
     parts = [p.strip() for p in env_str.replace(",", ";").split(";") if p.strip()]
@@ -130,8 +139,6 @@ def parse_profit_thresholds(env_str):
       - CUR=val          (e.g. GBP=3)
       - METHOD=val       (e.g. Skrill=3)
       - DEFAULT=val
-    Matching is case-insensitive for currencies and methods and ignores non-alphanumeric chars when comparing.
-    Returns tuple (exact_map, cur_map, method_map, default_val) where exact_map keys are (CUR, METHOD) normalized.
     """
     def norm_cur(c): return c.strip().upper()
     def norm_method(m): return re.sub(r'[^0-9a-z]', '', m.strip().lower())
@@ -164,7 +171,6 @@ def parse_profit_thresholds(env_str):
             elif k.strip().upper() in [c.upper() for c in currency_list]:
                 cur_map[norm_cur(k)] = val
             else:
-                # treat as method name
                 method_map[norm_method(k)] = val
     return exact, cur_map, method_map, default
 
@@ -198,26 +204,20 @@ def get_profit_threshold(cur, method):
     """Resolve profit threshold for given currency and method using PROFIT_THRESHOLDS rules and fallbacks."""
     ncur = (cur or "").strip().upper()
     nmethod = normalize_method_name(method or "")
-    # exact
     key = (ncur, nmethod)
     if key in exact_profit_map:
         return exact_profit_map[key]
-    # currency-only
     if ncur in profit_cur_map:
         return profit_cur_map[ncur]
-    # method-only
     if nmethod in profit_method_map:
         return profit_method_map[nmethod]
-    # default from PROFIT_THRESHOLDS env
     if profit_default is not None:
         return profit_default
-    # fallback global
     return float(PROFIT_THRESHOLD_PERCENT)
 
 
 # ---------------------- HTTP session ----------------------
 session = requests.Session()
-# keep original retry for non-429 transient server errors too
 retries = Retry(total=3, backoff_factor=0.3, status_forcelist=[500, 502, 503, 504])
 session.mount("https://", HTTPAdapter(max_retries=retries))
 HEADERS = {"Content-Type": "application/json", "User-Agent": "Mozilla/5.0 (compatible; ArbitrageChecker/1.0)"}
@@ -231,16 +231,11 @@ token_lock = threading.Lock()
 
 
 def acquire_token_blocking():
-    """
-    Token bucket: refill tokens proportional to elapsed seconds (fractional allowed).
-    Blocks until at least 1 token is available, then consumes and returns.
-    """
     while True:
         with token_lock:
             now = time.time()
             elapsed = now - token_bucket["last_refill"]
             if elapsed > 0:
-                # refill proportionally (allow fractional refill so tokens accumulate smoothly)
                 refill = (elapsed / 60.0) * REQUESTS_PER_MINUTE
                 token_bucket["tokens"] = min(float(REQUESTS_PER_MINUTE), token_bucket["tokens"] + refill)
                 token_bucket["last_refill"] = now
@@ -249,13 +244,11 @@ def acquire_token_blocking():
                 token_bucket["tokens"] -= 1.0
                 return True
 
-            # compute time until next token (seconds per token)
             sec_per_token = 60.0 / max(1, REQUESTS_PER_MINUTE)
             to_sleep = sec_per_token
         logging.debug(f"Token bucket empty, sleeping {to_sleep:.3f}s")
         time.sleep(to_sleep)
 
-# also keep a min-interval enforcement to avoid microbursts
 last_request_ts = [0.0]
 last_request_lock = threading.Lock()
 consecutive_429_count = 0
@@ -265,13 +258,9 @@ MIN_INTERVAL_BASE = max(0.0, 60.0 / max(1, REQUESTS_PER_MINUTE))
 
 
 def rate_limit_wait():
-    """
-    Enforce min-interval between requests and adapt multiplier when 429s happen.
-    """
     with consecutive_429_lock:
         c429 = consecutive_429_count
 
-    # multiplier grows with repeated 429s but cap it to avoid extreme long multipliers
     cap = 64
     if c429 <= 2:
         multiplier = 1.0
@@ -279,7 +268,6 @@ def rate_limit_wait():
         multiplier = min(cap, 2 ** (c429 - 1))
 
     effective_min_interval = MIN_INTERVAL_BASE * multiplier
-    # small random jitter to break pattern
     jitter = random.uniform(0, min(0.25 * effective_min_interval, 0.5))
 
     with last_request_lock:
@@ -301,7 +289,6 @@ def values_close(a, b, tol=ALERT_VALUE_TOLERANCE):
     except Exception:
         return False
 
-
 # ---------------------- fetch (FIRST matching ad logic) with smart backoff ----------------------
 
 def fetch_page_raw(fiat, pay_type, trade_type, page, rows=ROWS_PER_REQUEST):
@@ -310,7 +297,6 @@ def fetch_page_raw(fiat, pay_type, trade_type, page, rows=ROWS_PER_REQUEST):
     payload = {"asset": "USDT", "fiat": fiat, "tradeType": trade_type, "payTypes": [pay_type], "page": page, "rows": rows}
 
     for attempt in range(1, MAX_FETCH_RETRIES_ON_429 + 1):
-        # acquire global token and wait minimum interval
         acquire_token_blocking()
         rate_limit_wait()
         try:
@@ -320,7 +306,6 @@ def fetch_page_raw(fiat, pay_type, trade_type, page, rows=ROWS_PER_REQUEST):
                     consecutive_429_count += 1
                     c429_local = consecutive_429_count
 
-                # Check Retry-After header
                 ra = None
                 try:
                     ra_hdr = r.headers.get("Retry-After")
@@ -368,8 +353,7 @@ def fetch_page_raw(fiat, pay_type, trade_type, page, rows=ROWS_PER_REQUEST):
                 return []
     return []
 
-
-def find_first_ad(fiat, pay_type, trade_type, page_limit_threshold, rows=ROWS_PER_REQUEST):
+def find_first_ad(fiat, pay_type, trade_type, page_limit_min_threshold, page_limit_max_threshold=None, rows=ROWS_PER_REQUEST):
     for page in range(1, MAX_SCAN_PAGES + 1):
         items = fetch_page_raw(fiat, pay_type, trade_type, page, rows=rows)
         if not items:
@@ -386,10 +370,21 @@ def find_first_ad(fiat, pay_type, trade_type, page_limit_threshold, rows=ROWS_PE
 
             advertiser = entry.get("advertiser") or {}
             nick = advertiser.get("nickName") or advertiser.get("nick") or advertiser.get("userNo") or ""
-            logging.debug(f"[first-search] {fiat}/{pay_type}/{trade_type} p{page} price={price} min={min_lim} max={max_lim} adv_by={nick} thr={page_limit_threshold}")
+            logging.debug(
+                f"[first-search] {fiat}/{pay_type}/{trade_type} p{page} price={price} "
+                f"min={min_lim} max={max_lim} adv_by={nick} thr_min={page_limit_min_threshold} thr_max={page_limit_max_threshold}"
+            )
 
-            if min_lim <= page_limit_threshold:
-                logging.debug(f"[first-search-match] {fiat}/{pay_type}/{trade_type} p{page} -> price={price} min={min_lim} adv_by={nick}")
+            # check min <= min_threshold
+            min_ok = (min_lim <= page_limit_min_threshold)
+            # check max >= max_threshold, but treat 0 as "no max constraint"
+            if page_limit_max_threshold is None:
+                max_ok = True
+            else:
+                max_ok = (page_limit_max_threshold == 0) or (max_lim >= page_limit_max_threshold)
+
+            if min_ok and max_ok:
+                logging.debug(f"[first-search-match] {fiat}/{pay_type}/{trade_type} p{page} -> price={price} min={min_lim} max={max_lim} adv_by={nick}")
                 return {
                     "trade_type": trade_type,
                     "currency": fiat,
@@ -410,8 +405,6 @@ def format_currency_flag(cur):
 
 
 def _try_send_photo(payload_data, files=None):
-    """Attempt a single sendPhoto request. Return tuple(ok_bool, response_json_or_text, status_code)
-    """
     sendphoto_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
     try:
         if files is not None:
@@ -434,7 +427,6 @@ def send_telegram_alert(message):
         logging.info("Telegram token/chat not set; skipping send. Message preview:\n" + message)
         return False
 
-    # Try file_id first with small retry loop to avoid immediate fallback to text when transient network errors happen
     max_photo_attempts = 3
 
     if TELEGRAM_IMAGE_FILE_ID:
@@ -445,10 +437,8 @@ def send_telegram_alert(message):
                 logging.info("Telegram photo alert sent (file_id).")
                 return True
             logging.warning(f"sendPhoto(file_id) attempt {attempt}/{max_photo_attempts} failed status={status} resp={jr_or_text}")
-            # small backoff before retrying the photo
             time.sleep(0.5 * attempt + random.uniform(0, 0.3))
 
-    # Then try URL with small retries
     if TELEGRAM_IMAGE_URL:
         payload = {"chat_id": TELEGRAM_CHAT_ID, "photo": TELEGRAM_IMAGE_URL, "caption": (message if len(message) <= 1024 else (message[:1020] + "...")), "parse_mode": "HTML"}
         for attempt in range(1, max_photo_attempts + 1):
@@ -459,7 +449,6 @@ def send_telegram_alert(message):
             logging.warning(f"sendPhoto(via URL) attempt {attempt}/{max_photo_attempts} failed status={status} resp={jr_or_text}")
             time.sleep(0.5 * attempt + random.uniform(0, 0.3))
 
-        # upload fallback (download then upload) with a couple of retries
         try:
             img_resp = session.get(TELEGRAM_IMAGE_URL, timeout=10)
             img_resp.raise_for_status()
@@ -476,7 +465,6 @@ def send_telegram_alert(message):
         except Exception as e:
             logging.warning(f"sendPhoto(upload) exception: {e}")
 
-    # Text fallback (last resort)
     try:
         sendmsg_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         payload2 = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML", "disable_web_page_preview": True}
@@ -500,18 +488,14 @@ ZOOZ_LINK = 'https://zoozfx.com'
 ZOOZ_HTML = f'©️<a href="{ZOOZ_LINK}">ZoozFX</a>'
 
 def _make_hashtag(cur, method):
-    """Return a professional hashtag like #GBP_Skrill (HTML-escaped as code to preserve underscore)."""
     if not cur:
         cur_token = ""
     else:
         cur_token = str(cur).strip().upper()
-    # prefer friendly name if available
     method_label = friendly_pay_names.get(method, method) if method else method
     if not method_label:
         method_label = ""
-    # sanitize: replace non-alnum with underscore, collapse multiple underscores
     token = re.sub(r'[^0-9A-Za-z]+', '_', str(method_label).strip()).strip('_')
-    # limit length for safety
     if len(token) > 30:
         token = token[:30].rstrip('_')
     if not cur_token or not token:
@@ -523,7 +507,6 @@ def build_alert_message(cur, pay_friendly, seller_ad, buyer_ad, spread_percent):
     flag = format_currency_flag(cur)
     abs_diff = abs(buyer_ad["price"] - seller_ad["price"])
     sign = "+" if spread_percent > 0 else ""
-    # determine method token (prefer seller_ad.payment_method or buyer_ad.payment_method)
     method_name = (seller_ad.get("payment_method") or buyer_ad.get("payment_method") or pay_friendly)
     hashtag = _make_hashtag(cur, method_name)
     hashtag_line = (hashtag) if hashtag else ""
@@ -572,7 +555,6 @@ active_states = {}
 active_states_lock = threading.Lock()
 pair_locks = {}
 
-
 def get_pair_lock(pair_key):
     with active_states_lock:
         lock = pair_locks.get(pair_key)
@@ -580,7 +562,6 @@ def get_pair_lock(pair_key):
             lock = threading.Lock()
             pair_locks[pair_key] = lock
         return lock
-
 
 def get_active_state(pair_key):
     with active_states_lock:
@@ -596,13 +577,10 @@ def get_active_state(pair_key):
                 "last_sent_buy": None,
                 "last_sent_sell": None,
                 "last_sent_time": None,
-                # new fields for robust dedup / state tracking
-                "last_message_type": None,  # 'start','update','end'
+                "last_message_type": None,
                 "last_sent_signature": None
             }
-        # return a shallow copy so caller can't mutate shared dict
         return rec.copy()
-
 
 def set_active_state_snapshot(pair_key, *, active=None, last_spread=None, last_buy_price=None, last_sell_price=None, mark_sent=False, last_sent_signature=None, last_message_type=None):
     with active_states_lock:
@@ -638,7 +616,6 @@ def set_active_state_snapshot(pair_key, *, active=None, last_spread=None, last_b
             except Exception:
                 rec["last_sell_price"] = last_sell_price
         if mark_sent:
-            # update last_sent_* values and time
             rec["last_sent_spread"] = float(last_spread) if last_spread is not None else rec.get("last_sent_spread")
             rec["last_sent_buy"] = float(last_buy_price) if last_buy_price is not None else rec.get("last_sent_buy")
             rec["last_sent_sell"] = float(last_sell_price) if last_sell_price is not None else rec.get("last_sent_sell")
@@ -659,13 +636,8 @@ def relative_change_percent(old, new):
     except Exception:
         return float("inf")
 
-
 def compute_signature(spread, buy, sell, tol=ALERT_VALUE_TOLERANCE):
-    """Compute a lightweight signature (tuple of rounded bins) used for exact de-dup.
-    signature bins values by tolerance which avoids minor float noise causing new messages.
-    """
     if tol <= 0:
-        # fallback to a reasonably small tolerance
         tol = 1e-8
     try:
         s_bin = int(round(spread / tol))
@@ -681,24 +653,17 @@ def compute_signature(spread, buy, sell, tol=ALERT_VALUE_TOLERANCE):
         sel_bin = None
     return (s_bin, b_bin, sel_bin)
 
-
 def should_send_update(pair_state, new_spread, new_buy, new_sell, signature=None):
-    """
-    Decide whether an update (or start) message should be sent.
-    Uses signature-based de-duplication + previous thresholds.
-    """
     last_sent_spread = pair_state.get("last_sent_spread")
     last_sent_buy = pair_state.get("last_sent_buy")
     last_sent_sell = pair_state.get("last_sent_sell")
 
-    # If signature provided and dedup mode is exact, do a quick signature check
     if ALERT_DEDUP_MODE == 'exact' and signature is not None:
         last_sig = pair_state.get('last_sent_signature')
         if last_sig is not None and last_sig == signature:
             logging.debug(f"Dedup: signature match -> suppressing send (sig={signature})")
             return False
 
-    # initial send when nothing has been sent yet
     if last_sent_spread is None and last_sent_buy is None and last_sent_sell is None:
         return True
 
@@ -722,7 +687,6 @@ def should_send_update(pair_state, new_spread, new_buy, new_sell, signature=None
 
     return False
 
-
 def can_send_start(pair_state):
     last_sent_time = pair_state.get("last_sent_time")
     if last_sent_time is None or ALERT_TTL_SECONDS <= 0:
@@ -737,60 +701,57 @@ paytype_variants_map = {
     "DukascopyBank": ["DukascopyBank"],
 }
 
-
-def fast_probe_ads(currency, variant, threshold):
+def fast_probe_ads(currency, variant, min_threshold, max_threshold):
     """
     Cheap probe: fetch top (page=1, rows=FAST_PROBE_ROWS) for BUY and SELL.
-    If both top ads satisfy min_limit <= threshold and the spread looks good, return them.
-    Otherwise return (None, None) to fall back to full search.
+    Now checks both min and max thresholds (max_threshold==0 means ignore max).
     """
-    # perform BUY and SELL fetches (we do them sequentially - they are cheap because rows=1)
     buy_items = fetch_page_raw(currency, variant, "BUY", 1, rows=FAST_PROBE_ROWS)
     sell_items = fetch_page_raw(currency, variant, "SELL", 1, rows=FAST_PROBE_ROWS)
 
     if not buy_items or not sell_items:
         return None, None
 
-    # extract first adv from each
     b = buy_items[0]
     s = sell_items[0]
     adv_b = b.get("adv") or {}
     adv_s = s.get("adv") or {}
     buyer_price = safe_float(adv_b.get("price") or 0.0)
     buyer_min = safe_float(adv_b.get("minSingleTransAmount") or adv_b.get("minSingleTransAmountDisplay") or 0.0)
+    buyer_max = safe_float(adv_b.get("dynamicMaxSingleTransAmount") or adv_b.get("maxSingleTransAmount") or 0.0)
     seller_price = safe_float(adv_s.get("price") or 0.0)
     seller_min = safe_float(adv_s.get("minSingleTransAmount") or adv_s.get("minSingleTransAmountDisplay") or 0.0)
+    seller_max = safe_float(adv_s.get("dynamicMaxSingleTransAmount") or adv_s.get("maxSingleTransAmount") or 0.0)
 
-    # if min limits fit threshold on both sides -> compute spread
-    if buyer_min <= threshold and seller_min <= threshold and seller_price > 0:
+    min_ok = (buyer_min <= min_threshold and seller_min <= min_threshold)
+    # treat max_threshold==0 as "no max constraint"
+    max_ok = (max_threshold == 0) or (buyer_max >= max_threshold and seller_max >= max_threshold)
+
+    if min_ok and max_ok and seller_price > 0:
         spread_percent = ((buyer_price / seller_price) - 1.0) * 100.0
         if spread_percent >= PROFIT_THRESHOLD_PERCENT:
-            buyer_ad = {"trade_type":"BUY","currency":currency,"payment_method":variant,"price":buyer_price,"min_limit":buyer_min,"advertiser":b.get("advertiser")}
-            seller_ad = {"trade_type":"SELL","currency":currency,"payment_method":variant,"price":seller_price,"min_limit":seller_min,"advertiser":s.get("advertiser")}
+            buyer_ad = {"trade_type":"BUY","currency":currency,"payment_method":variant,"price":buyer_price,"min_limit":buyer_min,"max_limit":buyer_max,"advertiser":b.get("advertiser")}
+            seller_ad = {"trade_type":"SELL","currency":currency,"payment_method":variant,"price":seller_price,"min_limit":seller_min,"max_limit":seller_max,"advertiser":s.get("advertiser")}
             return buyer_ad, seller_ad
     return None, None
 
-
-def process_pair(currency, method, threshold):
+def process_pair(currency, method, min_threshold, max_threshold):
     variants = paytype_variants_map.get(method, [method])
     for variant in variants:
         pair_key = f"{currency}|{variant}"
         lock = get_pair_lock(pair_key)
         with lock:
-            # fast probe: quick low-cost check of top results
             buyer_ad = None
             seller_ad = None
             try:
-                buyer_ad, seller_ad = fast_probe_ads(currency, variant, threshold)
+                buyer_ad, seller_ad = fast_probe_ads(currency, variant, min_threshold, max_threshold)
             except Exception as e:
                 logging.debug(f"fast_probe failed for {pair_key}: {e}")
 
-            # if fast_probe didn't find a ready opportunity, fall back to full (first-ad) scans
             if not buyer_ad or not seller_ad:
-                # do BUY and SELL scans in parallel to save wall time (subject to token bucket)
                 with ThreadPoolExecutor(max_workers=2) as ex:
-                    fut_b = ex.submit(find_first_ad, currency, variant, "BUY", threshold)
-                    fut_s = ex.submit(find_first_ad, currency, variant, "SELL", threshold)
+                    fut_b = ex.submit(find_first_ad, currency, variant, "BUY", min_threshold, max_threshold)
+                    fut_s = ex.submit(find_first_ad, currency, variant, "SELL", min_threshold, max_threshold)
                     try:
                         buyer_ad = fut_b.result()
                     except Exception as e:
@@ -809,7 +770,6 @@ def process_pair(currency, method, threshold):
                 continue
 
             try:
-                # careful: buyer_ad is from BUY page (what you can sell at)
                 sell_price = float(buyer_ad["price"])  # price from BUY page (what you can sell at)
                 buy_price = float(seller_ad["price"])  # price from SELL page (what you can buy at)
                 spread_percent = ((sell_price / buy_price) - 1.0) * 100.0
@@ -817,22 +777,16 @@ def process_pair(currency, method, threshold):
                 logging.warning(f"Spread calc error for {pair_key}: {e}")
                 continue
 
-            # resolve profit threshold per pair
             profit_thresh = get_profit_threshold(currency, variant)
             pay_friendly = friendly_pay_names.get(variant, variant)
-            logging.info(f"{pair_key} sell_price(from BUY page)={sell_price:.4f} buy_price(from SELL page)={buy_price:.4f} spread={spread_percent:.2f}% profit_thr={profit_thresh} thr={threshold} min_sell={buyer_ad['min_limit']:.2f} min_buy={seller_ad['min_limit']:.2f}")
+            logging.info(f"{pair_key} sell_price(from BUY page)={sell_price:.4f} buy_price(from SELL page)={buy_price:.4f} spread={spread_percent:.2f}% profit_thr={profit_thresh} min_thr={min_threshold} max_thr={max_threshold} min_sell={buyer_ad.get('min_limit',0):.2f} min_buy={seller_ad.get('min_limit',0):.2f} max_sell={buyer_ad.get('max_limit',0):.2f} max_buy={seller_ad.get('max_limit',0):.2f}")
 
             state = get_active_state(pair_key)
             was_active = state["active"]
-
-            # compute signature for dedup
             current_sig = compute_signature(spread_percent, buy_price, sell_price)
 
-            # decide start / update / end (send only one message per cycle)
             if spread_percent >= profit_thresh:
-                # Opportunity exists
                 if not was_active:
-                    # We are not currently active -> candidate for START
                     if not should_send_update(state, spread_percent, buy_price, sell_price, signature=current_sig):
                         logging.debug(f"{pair_key}: Start suppressed (duplicate values). Marking active without sending.")
                         set_active_state_snapshot(pair_key, active=True, last_spread=spread_percent,
@@ -852,7 +806,6 @@ def process_pair(currency, method, threshold):
                             set_active_state_snapshot(pair_key, active=True, last_spread=spread_percent,
                                                       last_buy_price=buy_price, last_sell_price=sell_price, mark_sent=False)
                 else:
-                    # already active -> candidate for UPDATE
                     if should_send_update(state, spread_percent, buy_price, sell_price, signature=current_sig):
                         msg = build_update_message(currency, pay_friendly, seller_ad, buyer_ad, spread_percent)
                         sent = send_telegram_alert(msg)
@@ -863,11 +816,9 @@ def process_pair(currency, method, threshold):
                         else:
                             logging.warning(f"Failed to send update for {pair_key}")
                     else:
-                        # update suppressed but keep active state and last values
                         set_active_state_snapshot(pair_key, active=True, last_spread=spread_percent,
                                                   last_buy_price=buy_price, last_sell_price=sell_price, mark_sent=False)
             else:
-                # Not an opportunity: ensure we transition to inactive (END) when appropriate
                 if was_active:
                     if should_send_update(state, spread_percent, buy_price, sell_price, signature=current_sig):
                         msg = build_end_message(currency, pay_friendly, seller_ad, buyer_ad, spread_percent)
@@ -886,23 +837,36 @@ def process_pair(currency, method, threshold):
                     set_active_state_snapshot(pair_key, active=False, last_spread=spread_percent,
                                               last_buy_price=buy_price, last_sell_price=sell_price, mark_sent=False)
 
-        # processed variant -> break
-        break
+        break  # only process first matching variant
 
 # ---------------------- main loop ----------------------
 
 def build_pairs_to_monitor():
-    """Construct pairs_to_monitor list (currency, method, min_limit) taking into account PAIRS_ENV, SELECTED_CURRENCY, SELECTED_METHOD and global payment method filters."""
+    """
+    Construct list of tuples: (currency, method, min_threshold, max_threshold)
+    """
     local_pairs = []
-    min_limit_thresholds = parse_thresholds(MIN_LIMIT_THRESHOLDS_ENV, currency_list)
+    min_limit_thresholds = parse_thresholds(MIN_LIMIT_THRESHOLDS_ENV, currency_list, DEFAULT_MIN_LIMIT)
+    max_limit_thresholds = parse_thresholds(MAX_LIMIT_THRESHOLDS_ENV, currency_list, DEFAULT_MAX_LIMIT)
+
     if PAIRS_ENV:
+        # If you have a parse_pairs_env implementation, adapt it to include both thresholds.
+        # For backward compatibility here we'll assume parse_pairs_env returns (cur,method, minthr) as before.
         local_pairs = parse_pairs_env(PAIRS_ENV, min_limit_thresholds, payment_methods_map)
+        # convert to include max thresholds
+        full_pairs = []
+        for cur, m, minthr in local_pairs:
+            maxthr = max_limit_thresholds.get(cur, DEFAULT_MAX_LIMIT)
+            full_pairs.append((cur, m, minthr, maxthr))
+        local_pairs = full_pairs
     else:
         if SELECTED_CURRENCY == "ALL":
             for cur in currency_list:
                 methods = payment_methods_map.get(cur, [])
                 for m in methods:
-                    local_pairs.append((cur, m, min_limit_thresholds.get(cur, float("inf"))))
+                    minthr = min_limit_thresholds.get(cur, DEFAULT_MIN_LIMIT)
+                    maxthr = max_limit_thresholds.get(cur, DEFAULT_MAX_LIMIT)
+                    local_pairs.append((cur, m, minthr, maxthr))
         else:
             cur = SELECTED_CURRENCY
             methods = payment_methods_map.get(cur, [])
@@ -915,15 +879,17 @@ def build_pairs_to_monitor():
                     raise SystemExit(1)
                 methods = [SELECTED_METHOD]
             for m in methods:
-                local_pairs.append((cur, m, min_limit_thresholds.get(cur, float("inf"))))
+                minthr = min_limit_thresholds.get(cur, DEFAULT_MIN_LIMIT)
+                maxthr = max_limit_thresholds.get(cur, DEFAULT_MAX_LIMIT)
+                local_pairs.append((cur, m, minthr, maxthr))
 
     # apply whitelist/exclude filters
     filtered = []
-    for cur, m, thr in local_pairs:
+    for cur, m, minthr, maxthr in local_pairs:
         if not method_allowed(m):
             logging.debug(f"Filtered out {cur}|{m} by PAYMENT_METHODS/EXCLUDE settings")
             continue
-        filtered.append((cur, m, thr))
+        filtered.append((cur, m, minthr, maxthr))
     if not filtered:
         logging.error("No currency/payment pairs selected after applying PAYMENT_METHODS filter. Exiting.")
         raise SystemExit(1)
@@ -939,9 +905,8 @@ def run_monitor_loop():
 
             futures = []
             with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_WORKERS) as ex:
-                for cur, m, thr in pairs_to_monitor:
-                    futures.append(ex.submit(process_pair, cur, m, thr))
-                    # small optional stagger — if you have token bucket this is less critical
+                for cur, m, minthr, maxthr in pairs_to_monitor:
+                    futures.append(ex.submit(process_pair, cur, m, minthr, maxthr))
                     time.sleep(SLEEP_BETWEEN_PAIRS)
 
                 for f in as_completed(futures):
