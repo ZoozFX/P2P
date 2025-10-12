@@ -65,7 +65,7 @@ EXCLUDE_PAYMENT_METHODS_ENV = os.getenv("EXCLUDE_PAYMENT_METHODS", "").strip()  
 PROFIT_THRESHOLDS_ENV = os.getenv("PROFIT_THRESHOLDS", "").strip()  # e.g. "GBP:Skrill=3.5;EUR=3;Skrill=3.2;DEFAULT=3"
 
 # ---------------------- static lists ----------------------
-currency_list = ["USD", "GBP", "EUR"]
+currency_list = ["USD", "GBP", "EUR", "EGP", "MAD", "SAR"]
 
 payment_methods_map = {
     "EGP": [
