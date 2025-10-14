@@ -513,8 +513,7 @@ def build_alert_message(cur, pay_friendly, seller_ad, buyer_ad, spread_percent):
     
     seller_price = seller_ad['price']
     buyer_price = buyer_ad['price']
-    fee_factor = 1.0 if cur == "EGP" else 0.9855
-    profit_value = ((100*fee_factor*seller_price)/buyer_price)-100
+    profit_value = ((100*0.9855*seller_price)/buyer_price)-100
     sign = "+" if spread_percent >= 0 else ""
     
     return (
@@ -537,8 +536,7 @@ def build_update_message(cur, pay_friendly, seller_ad, buyer_ad, spread_percent)
 
     seller_price = seller_ad['price']
     buyer_price = buyer_ad['price']
-    fee_factor = 1.0 if cur == "EGP" else 0.9855
-    profit_value = ((100*fee_factor*seller_price)/buyer_price)-100
+    profit_value = ((100*0.9855*seller_price)/buyer_price)-100
     sign = "+" if spread_percent >= 0 else ""
     
     return (
@@ -561,8 +559,7 @@ def build_end_message(cur, pay_friendly, seller_ad, buyer_ad, spread_percent):
 
     seller_price = seller_ad['price']
     buyer_price = buyer_ad['price']
-    fee_factor = 1.0 if cur == "EGP" else 0.9855
-    profit_value = ((100*fee_factor*seller_price)/buyer_price)-100
+    profit_value = ((100*0.9855*seller_price)/buyer_price)-100
     sign = "+" if spread_percent >= 0 else ""
     
     return (
